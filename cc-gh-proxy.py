@@ -557,6 +557,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "max_tokens": body.get("max_tokens"),
             "n_messages": len(body.get("messages", [])),
         }
+        # Include metadata.user_id if present (Claude Code session identifier)
+        metadata: JsonDict | None = body.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("user_id"):
+            entry["user_id"] = metadata["user_id"]
         # Include tool names if any
         tools: list[JsonDict] | None = body.get("tools")
         if tools:

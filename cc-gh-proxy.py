@@ -381,7 +381,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_post(self) -> None:
         # Only allow the Anthropic messages endpoint
-        if self.path != "/v1/messages":
+        if not self.path.startswith("/v1/messages"):
             self.send_error(404, "Not found")
             return
 

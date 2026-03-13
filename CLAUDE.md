@@ -20,7 +20,7 @@ Claude Code --> localhost:4000 --> api.githubcopilot.com/v1/messages
 - **OAuth tokens only**: GitHub PATs (classic and fine-grained) don't work with the Copilot API. Must use `gh auth token` with copilot scope.
 - **Per-project activation**: Projects opt in via `.claude/settings.json` with `ANTHROPIC_BASE_URL=http://localhost:4000`. Other projects use Anthropic directly.
 - **API key gating**: Optional `--api-key` validates the `x-api-key` header Claude Code sends (set via `ANTHROPIC_API_KEY` in the project). Prevents unauthorized use of the proxy. Claude Code shows "API Usage Billing" but no Anthropic charges occur since requests go to Copilot, not Anthropic.
-- **Model name mapping**: Claude Code sends dashes (`claude-opus-4-6`), Copilot expects dots (`claude-opus-4.6`). Date suffixes and base family names also handled.
+- **Model name mapping**: Claude Code sends dashes (`claude-opus-4-6`), Copilot expects dots (`claude-opus-4.6`). Bracket suffixes (`[1m]`), date suffixes, and base family names also handled.
 - **cache_control stripping**: Claude Code sends `{"type": "ephemeral", "scope": "turn"}` but Copilot only accepts `{"type": "ephemeral"}`.
 - **Beta header filtering**: Strips `context-*` beta features from `anthropic-beta` header (Copilot rejects unknown betas like `context-1m-2025-08-07`).
 - **Token auto-refresh**: `TokenManager` re-fetches `gh auth token` hourly and retries on 401.

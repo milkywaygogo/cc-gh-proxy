@@ -13,7 +13,9 @@ so this proxy only needs to:
 from __future__ import annotations
 
 import argparse
+import hmac
 import http.client
+import ipaddress
 import json
 import logging
 import os
@@ -29,13 +31,19 @@ from socketserver import ThreadingMixIn
 from typing import Any
 
 COPILOT_HOST: str = "api.githubcopilot.com"
+MAX_BODY_SIZE: int = 10 * 1024 * 1024  # 10 MB
 JsonDict = dict[str, Any]
+
+
+class TokenError(Exception):
+    """Raised when the GitHub OAuth token cannot be obtained or refreshed."""
 
 logger: logging.Logger = logging.getLogger("cc-gh-proxy")
 
 # Set in main() before server starts
 _log_dir: Path = Path()
 _api_key: str | None = None
+_log_requests: bool = False  # Log request/response content (opt-in)
 
 # ---------------------------------------------------------------------------
 # CLI arguments
@@ -71,19 +79,30 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("PROXY_LOG_LEVEL", "INFO").upper(),
         help="log level (env: PROXY_LOG_LEVEL, default: INFO)",
     )
+    p.add_argument(
+        "--log-requests",
+        action="store_true",
+        default=os.environ.get("PROXY_LOG_REQUESTS", "").lower() in ("1", "true", "yes"),
+        help="log request/response content including message text (env: PROXY_LOG_REQUESTS, default: off)",
+    )
     return p.parse_args()
 
 
 def setup_logging(log_dir: Path, level: str) -> None:
     """Configure console and file logging."""
     log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.chmod(0o700)
     logger.setLevel(getattr(logging, level, logging.INFO))
 
     console = logging.StreamHandler(sys.stderr)
     console.setFormatter(logging.Formatter("[proxy] %(message)s"))
     logger.addHandler(console)
 
-    fh = logging.FileHandler(log_dir / "proxy.log")
+    # Pre-create with restricted permissions before FileHandler opens it
+    log_file = log_dir / "proxy.log"
+    fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.close(fd)
+    fh = logging.FileHandler(log_file)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(fh)
 
@@ -94,7 +113,8 @@ def setup_logging(log_dir: Path, level: str) -> None:
 
 def log_jsonl(entry: JsonDict) -> None:
     """Append a JSON line to the requests log."""
-    with open(_log_dir / "requests.jsonl", "a") as f:
+    path = _log_dir / "requests.jsonl"
+    with open(path, "a", opener=lambda p, f: os.open(p, f, 0o600)) as f:
         f.write(json.dumps(entry, default=str) + "\n")
 
 
@@ -102,26 +122,28 @@ def summarize_request(body: JsonDict) -> str:
     """One-line summary of a request for the console log."""
     model: str = body.get("model", "?")
     stream: bool = body.get("stream", False)
-    msgs: list[JsonDict] = body.get("messages", [])
-    n_msgs: int = len(msgs)
-
-    # Last user message preview
-    last_user: str = ""
-    for msg in reversed(msgs):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                last_user = content
-            elif isinstance(content, list):
-                texts = [b.get("text", "") for b in content if b.get("type") == "text"]
-                last_user = " ".join(texts)
-            break
-    preview: str = last_user[:80].replace("\n", " ")
-    if len(last_user) > 80:
-        preview += "..."
-
+    n_msgs: int = len(body.get("messages", []))
     flag: str = " [stream]" if stream else ""
-    return f"{model} ({n_msgs} msgs{flag}) \"{preview}\""
+    summary = f"{model} ({n_msgs} msgs{flag})"
+
+    if _log_requests:
+        # Include last user message preview only when content logging is enabled
+        last_user: str = ""
+        for msg in reversed(body.get("messages", [])):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    last_user = content
+                elif isinstance(content, list):
+                    texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+                    last_user = " ".join(texts)
+                break
+        preview: str = last_user[:80].replace("\n", " ")
+        if len(last_user) > 80:
+            preview += "..."
+        summary += f' "{preview}"'
+
+    return summary
 
 
 def summarize_response(
@@ -141,17 +163,23 @@ def summarize_response(
         out: int = usage.get("output_tokens", 0)
         cached: int = usage.get("cache_read_input_tokens", 0)
         stop: str = body.get("stop_reason", "?")
-        text: str = ""
-        for block in body.get("content", []):
-            if block.get("type") == "text":
-                text = block.get("text", "")[:80].replace("\n", " ")
-                break
         cache_info: str = f", cached={cached}" if cached else ""
-        return f"OK in={inp} out={out}{cache_info} stop={stop} \"{text}...\""
+        summary = f"OK in={inp} out={out}{cache_info} stop={stop}"
+        if _log_requests:
+            text: str = ""
+            for block in body.get("content", []):
+                if block.get("type") == "text":
+                    text = block.get("text", "")[:80].replace("\n", " ")
+                    break
+            summary += f' "{text}..."'
+        return summary
 
     if stream_text is not None:
-        preview: str = stream_text[:80].replace("\n", " ")
-        return f"OK [streamed] \"{preview}...\""
+        summary = "OK [streamed]"
+        if _log_requests:
+            preview: str = stream_text[:80].replace("\n", " ")
+            summary += f' "{preview}..."'
+        return summary
 
     return f"HTTP {status}"
 
@@ -165,8 +193,7 @@ def get_gh_token() -> str:
         ["gh", "auth", "token"], capture_output=True, text=True
     )
     if result.returncode != 0:
-        logger.error("Failed to get gh token. Run: gh auth refresh -s copilot")
-        sys.exit(1)
+        raise TokenError("Failed to get gh token. Run: gh auth refresh -s copilot")
     return result.stdout.strip()
 
 
@@ -181,16 +208,19 @@ class TokenManager:
 
     def __init__(self) -> None:
         self._lock: threading.Lock = threading.Lock()
-        self._token: str = get_gh_token()
+        try:
+            self._token: str = get_gh_token()
+        except TokenError as e:
+            logger.error("%s", e)
+            sys.exit(1)
         self._fetched_at: float = time.monotonic()
-        logger.info("Token acquired: %s...%s", self._token[:8], self._token[-4:])
+        logger.info("Token acquired successfully")
 
     def get_token(self) -> str:
         """Return a valid token, refreshing if stale."""
-        age: float = time.monotonic() - self._fetched_at
-        if age < self.REFRESH_INTERVAL:
+        # Fast lockless pre-check: float read is atomic in CPython (GIL).
+        if time.monotonic() - self._fetched_at < self.REFRESH_INTERVAL:
             return self._token
-
         with self._lock:
             # Double-check after acquiring lock
             if time.monotonic() - self._fetched_at < self.REFRESH_INTERVAL:
@@ -207,8 +237,8 @@ class TokenManager:
             new_token: str = get_gh_token()
             self._token = new_token
             self._fetched_at = time.monotonic()
-            logger.info("Token refreshed: %s...%s", new_token[:8], new_token[-4:])
-        except SystemExit:
+            logger.info("Token refreshed successfully")
+        except TokenError:
             logger.error("Token refresh failed, keeping old token")
         return self._token
 
@@ -217,26 +247,37 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+# Module-level constants for model name mapping (avoid rebuilding per call)
+_MODEL_STATIC_MAP: dict[str, str] = {
+    "claude-opus-4-6": "claude-opus-4.6",
+    "claude-sonnet-4-6": "claude-sonnet-4.6",
+    "claude-haiku-4-5": "claude-haiku-4.5",
+}
+_MODEL_FAMILY_MAP: dict[str, str] = {
+    "claude-opus-4": "claude-opus-4.6",
+    "claude-sonnet-4": "claude-sonnet-4.6",
+    "claude-haiku-4": "claude-haiku-4.5",
+}
+
+
 def map_model_name(model: str) -> str:
     """Map Anthropic model IDs to Copilot model names.
 
     Claude Code may send:
-      claude-opus-4-6, claude-opus-4-6-20260312, claude-sonnet-4-6, etc.
+      claude-opus-4-6, claude-opus-4-6[1m], claude-opus-4-6-20260312, etc.
     Copilot expects:
       claude-opus-4.6, claude-sonnet-4.6, claude-haiku-4.5
     """
-    static_map: dict[str, str] = {
-        "claude-opus-4-6": "claude-opus-4.6",
-        "claude-sonnet-4-6": "claude-sonnet-4.6",
-        "claude-haiku-4-5": "claude-haiku-4.5",
-    }
-    if model in static_map:
-        return static_map[model]
+    # Strip bracket suffixes: claude-opus-4-6[1m] -> claude-opus-4-6
+    model = re.sub(r"\[[^\]]*\]$", "", model)
+
+    if model in _MODEL_STATIC_MAP:
+        return _MODEL_STATIC_MAP[model]
 
     # Strip date suffixes: claude-opus-4-6-20260312 -> claude-opus-4-6
     stripped: str = re.sub(r"-\d{8}$", "", model)
-    if stripped in static_map:
-        return static_map[stripped]
+    if stripped in _MODEL_STATIC_MAP:
+        return _MODEL_STATIC_MAP[stripped]
 
     # Pattern: claude-{tier}-{major}-{minor} -> claude-{tier}-{major}.{minor}
     m = re.match(r"^(claude-(?:opus|sonnet|haiku)-\d+)-(\d+)$", stripped)
@@ -244,13 +285,8 @@ def map_model_name(model: str) -> str:
         return f"{m.group(1)}.{m.group(2)}"
 
     # Base family: claude-opus-4 -> claude-opus-4.6 (latest known)
-    family_map: dict[str, str] = {
-        "claude-opus-4": "claude-opus-4.6",
-        "claude-sonnet-4": "claude-sonnet-4.6",
-        "claude-haiku-4": "claude-haiku-4.5",
-    }
-    if stripped in family_map:
-        return family_map[stripped]
+    if stripped in _MODEL_FAMILY_MAP:
+        return _MODEL_FAMILY_MAP[stripped]
 
     logger.warning("Unknown model '%s', passing through as-is", model)
     return model
@@ -279,6 +315,19 @@ def strip_cache_control_extras(obj: Any) -> Any:
     return obj
 
 
+# Anthropic Messages API top-level fields (allowlist)
+ALLOWED_BODY_FIELDS: set[str] = {
+    "model", "messages", "max_tokens",
+    "temperature", "top_p", "top_k", "stop_sequences",
+    "system",
+    "tools", "tool_choice",
+    "stream",
+    "thinking",
+    "metadata",
+    "service_tier",
+}
+
+
 def rewrite_body(raw_body: bytes) -> tuple[bytes, JsonDict]:
     """Rewrite model names and strip unsupported fields.
 
@@ -292,6 +341,14 @@ def rewrite_body(raw_body: bytes) -> tuple[bytes, JsonDict]:
     mapped: str = map_model_name(original)
     if mapped != original:
         body["model"] = mapped
+        modified = True
+
+    # Drop any fields not in the Anthropic Messages API spec
+    unknown = [k for k in body if k not in ALLOWED_BODY_FIELDS]
+    if unknown:
+        for key in unknown:
+            logger.debug("Stripping unsupported field: %s", key)
+        body = {k: v for k, v in body.items() if k in ALLOWED_BODY_FIELDS}
         modified = True
 
     # Strip unsupported cache_control fields
@@ -315,18 +372,36 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._handle_post()
         except (ConnectionResetError, BrokenPipeError):
             logger.debug("Client disconnected")
+        except Exception:
+            logger.exception("Unhandled error handling request")
+            try:
+                self.send_error(500, "Internal server error")
+            except Exception:
+                pass
 
     def _handle_post(self) -> None:
+        # Only allow the Anthropic messages endpoint
+        if self.path != "/v1/messages":
+            self.send_error(404, "Not found")
+            return
+
         # Check API key if configured
         if _api_key:
             client_key: str = self.headers.get("x-api-key", "")
-            if client_key != _api_key:
+            if not hmac.compare_digest(client_key, _api_key):
                 self.send_error(401, "Invalid or missing API key")
                 logger.warning("Rejected request: bad x-api-key")
                 return
 
         t0: float = time.monotonic()
-        content_length: int = int(self.headers.get("Content-Length", "0"))
+        try:
+            content_length: int = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(400, "Invalid Content-Length")
+            return
+        if content_length > MAX_BODY_SIZE:
+            self.send_error(413, "Request body too large")
+            return
         raw_body: bytes = self.rfile.read(content_length)
 
         # Rewrite model name and strip unsupported fields
@@ -363,7 +438,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         conn = http.client.HTTPSConnection(COPILOT_HOST, context=SSL_CTX)
         try:
             conn.request(
-                "POST", self.path, body=body_to_send, headers=upstream_headers
+                "POST", "/v1/messages", body=body_to_send, headers=upstream_headers
             )
             resp: http.client.HTTPResponse = conn.getresponse()
 
@@ -376,7 +451,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 upstream_headers["Authorization"] = f"Bearer {new_token}"
                 conn = http.client.HTTPSConnection(COPILOT_HOST, context=SSL_CTX)
                 conn.request(
-                    "POST", self.path, body=body_to_send, headers=upstream_headers
+                    "POST", "/v1/messages", body=body_to_send, headers=upstream_headers
                 )
                 resp = conn.getresponse()
 
@@ -416,26 +491,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         self.wfile.flush()
 
                 elapsed_ms = (time.monotonic() - t0) * 1000
-                stream_text: str = self._extract_stream_text(
-                    collected.decode(errors="replace")
-                )
+                decoded_stream: str = collected.decode(errors="replace")
+                stream_text: str = self._extract_stream_text(decoded_stream)
                 logger.info(
                     "<<< %dms %s",
                     elapsed_ms,
                     summarize_response(resp.status, None, stream_text),
                 )
+                stream_resp_log: JsonDict = {
+                    "status": resp.status,
+                    "stream": True,
+                    "usage": self._extract_stream_usage(decoded_stream),
+                }
+                if _log_requests:
+                    stream_resp_log["text_preview"] = stream_text[:500]
                 log_jsonl({
                     "ts": time.time(),
                     "path": self.path,
                     "request": self._request_log_entry(parsed_body),
-                    "response": {
-                        "status": resp.status,
-                        "stream": True,
-                        "text_preview": stream_text[:500],
-                        "usage": self._extract_stream_usage(
-                            collected.decode(errors="replace")
-                        ),
-                    },
+                    "response": stream_resp_log,
                     "elapsed_ms": round(elapsed_ms),
                 })
             else:
@@ -454,15 +528,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     elapsed_ms,
                     summarize_response(resp.status, resp_body, None),
                 )
+                nonstream_resp_log: JsonDict = {
+                    "status": resp.status,
+                    "stream": False,
+                }
+                if resp_body:
+                    nonstream_resp_log["usage"] = resp_body.get("usage", {})
+                    nonstream_resp_log["stop_reason"] = resp_body.get("stop_reason")
+                if _log_requests and resp_body:
+                    nonstream_resp_log["body"] = resp_body
                 log_jsonl({
                     "ts": time.time(),
                     "path": self.path,
                     "request": self._request_log_entry(parsed_body),
-                    "response": {
-                        "status": resp.status,
-                        "stream": False,
-                        "body": resp_body,
-                    },
+                    "response": nonstream_resp_log,
                     "elapsed_ms": round(elapsed_ms),
                 })
 
@@ -482,20 +561,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
         tools: list[JsonDict] | None = body.get("tools")
         if tools:
             entry["tools"] = [t.get("name", "") for t in tools]
-        # Last user message
-        for msg in reversed(body.get("messages", [])):
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    entry["last_user_message"] = content[:500]
-                elif isinstance(content, list):
-                    texts = [
-                        b.get("text", "")
-                        for b in content
-                        if b.get("type") == "text"
-                    ]
-                    entry["last_user_message"] = " ".join(texts)[:500]
-                break
+        # Last user message — only when content logging is enabled
+        if _log_requests:
+            for msg in reversed(body.get("messages", [])):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        entry["last_user_message"] = content[:500]
+                    elif isinstance(content, list):
+                        texts = [
+                            b.get("text", "")
+                            for b in content
+                            if b.get("type") == "text"
+                        ]
+                        entry["last_user_message"] = " ".join(texts)[:500]
+                    break
         return entry
 
     @staticmethod
@@ -546,14 +626,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def log_message(self, format: str, *args: object) -> None:
-        # Suppress default BaseHTTPRequestHandler logging (we do our own)
-        pass
+        # Route through our logger instead of BaseHTTPRequestHandler's default
+        logger.debug(format, *args)
+
+
+def _is_loopback(host: str) -> bool:
+    """Return True if host resolves to a loopback address."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 if __name__ == "__main__":
     args = parse_args()
     _log_dir = Path(args.log_dir)
     _api_key = args.api_key
+    _log_requests = args.log_requests
 
     setup_logging(_log_dir, args.log_level)
     token_manager = TokenManager()
@@ -566,6 +657,15 @@ if __name__ == "__main__":
         logger.info("  API key: not configured (open access)")
     logger.info("  Token auto-refresh: every %ds", TokenManager.REFRESH_INTERVAL)
     logger.info("  Logs: %s", _log_dir)
+    if _log_requests:
+        logger.info("  Request logging: ENABLED (message content will be persisted)")
+
+    if not _is_loopback(args.host):
+        logger.warning(
+            "Proxy is binding to %s — NOT a loopback address. "
+            "Requests and API keys are transmitted in cleartext over the network.",
+            args.host,
+        )
 
     server = ThreadingHTTPServer((args.host, args.port), ProxyHandler)
     try:

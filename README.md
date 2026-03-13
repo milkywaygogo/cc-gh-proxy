@@ -89,7 +89,15 @@ If you start the proxy with `--api-key`, also set `ANTHROPIC_API_KEY`:
 }
 ```
 
-Only projects with this setting use the proxy. All other projects use Anthropic directly.
+Alternatively, you can set these as regular environment variables instead of using
+`settings.json`:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:4000
+export ANTHROPIC_API_KEY=my-secret-key  # only if proxy uses --api-key
+```
+
+Only projects/sessions with these settings use the proxy. All others use Anthropic directly.
 
 ## Usage
 
@@ -160,8 +168,9 @@ All options can be set via CLI arguments or environment variables. CLI takes pre
 ### API key authentication
 
 When `--api-key` is set, the proxy validates the `x-api-key` header on every request.
-Claude Code sends this header automatically when `ANTHROPIC_API_KEY` is set in the
-project's `.claude/settings.json`. Requests with a missing or wrong key get a 401.
+Claude Code sends this header automatically when `ANTHROPIC_API_KEY` is set (either in
+`.claude/settings.json` or as an environment variable). Requests with a missing or wrong
+key get a 401.
 
 Note: setting `ANTHROPIC_API_KEY` makes Claude Code show "API Usage Billing" in the
 status bar, but no Anthropic charges occur since requests go to Copilot, not Anthropic.

@@ -16,7 +16,7 @@ if curl -sf "$BASE/health" > /dev/null 2>&1; then
     green "PASS: Proxy is running on port $PORT"
     PASS=$((PASS+1))
 else
-    red "FAIL: Proxy not running on port $PORT. Start it with: ./start.sh"
+    red "FAIL: Proxy not running on port $PORT. Start it with: ./cc-gh-proxy.py"
     exit 1
 fi
 

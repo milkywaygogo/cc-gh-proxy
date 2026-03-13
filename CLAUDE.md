@@ -35,7 +35,6 @@ Claude Code --> localhost:4000 --> api.githubcopilot.com/v1/messages
 
 ## Known issues / history
 
-- `urllib.request` buffers SSE — that's why we use `http.client.HTTPSConnection` with byte-by-byte reads
-- Streaming reads 1 byte at a time (flush on newline) — works but could use chunked buffering for efficiency
-- The `get_gh_token()` function calls `sys.exit(1)` on failure, which the `TokenManager._refresh()` catches as `SystemExit`
+- `urllib.request` buffers SSE — that's why we use `http.client.HTTPSConnection` with chunked reads
+- The `get_gh_token()` function raises `TokenError` on failure, which `TokenManager._refresh()` catches gracefully
 - Setting `ANTHROPIC_API_KEY` for proxy auth makes Claude Code show "API Usage Billing" — harmless since no requests reach Anthropic

@@ -482,12 +482,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if is_stream:
                 collected: bytearray = bytearray()
                 while True:
-                    chunk: bytes = resp.read(1)
+                    chunk: bytes = resp.read(4096)
                     if not chunk:
                         break
                     self.wfile.write(chunk)
                     collected.extend(chunk)
-                    if chunk == b"\n":
+                    if b"\n" in chunk:
                         self.wfile.flush()
 
                 elapsed_ms = (time.monotonic() - t0) * 1000

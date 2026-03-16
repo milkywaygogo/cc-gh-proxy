@@ -2,15 +2,24 @@
 
 Pass-through proxy: Claude Code -> GitHub Copilot using Copilot's **native Anthropic Messages API**.
 
-Unlike every other copilot proxy out there, this does NOT translate between OpenAI and Anthropic formats. GitHub Copilot natively supports the Anthropic Messages API at `https://api.githubcopilot.com/v1/messages` — we just forward requests as-is with auth swapped and minor field cleanup.
+For Claude models: native pass-through to `/v1/messages` with no format translation.
+For non-Claude models (GPT-5 mini, GPT-5.1, etc.): translates between Anthropic and OpenAI formats via `/chat/completions` (experimental).
 
 ## Architecture
 
 ```
-Claude Code --> localhost:4000 --> api.githubcopilot.com/v1/messages
-             (swap auth token,    (native Anthropic Messages API,
-              map model names,     no format translation)
-              strip cache_control)
+Claude models:
+  Claude Code --> localhost:4000 --> api.githubcopilot.com/v1/messages
+               (swap auth token,    (native Anthropic Messages API)
+                map model names,
+                strip cache_control)
+
+Non-Claude models (--upstream-model gpt-5-mini):
+  Claude Code --> localhost:4000 --> api.githubcopilot.com/chat/completions
+               (Anthropic→OpenAI      (OpenAI Chat Completions API,
+                translation,           requires Copilot OAuth token)
+                OpenAI→Anthropic
+                response translation)
 ```
 
 ## Key decisions
@@ -26,6 +35,8 @@ Claude Code --> localhost:4000 --> api.githubcopilot.com/v1/messages
 - **Token auto-refresh**: `TokenManager` re-fetches `gh auth token` hourly and retries on 401.
 - **Threading**: `ThreadingHTTPServer` handles concurrent requests from Claude Code.
 - **CLI + env config**: All options (port, host, api-key, log-dir, log-level) configurable via CLI args or env vars.
+- **Non-Claude model support** (EXPERIMENTAL): `--upstream-model gpt-5-mini` translates Anthropic↔OpenAI formats. Requires `--copilot-auth` which does a one-time OAuth device flow to get a Copilot API token. Available: gpt-5-mini (0x), gpt-4.1 (0x), gpt-5.1, gpt-5.2, gpt-4o, gemini-2.5-pro. Codex models (/responses only) not supported.
+- **Two auth modes**: `gh auth token` for Claude models on `/v1/messages`; Copilot OAuth app (`Iv1.b507a08c87ecfe98`) device flow for non-Claude models on `/chat/completions`.
 
 ## Files
 

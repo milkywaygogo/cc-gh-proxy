@@ -111,11 +111,78 @@ def setup_logging(log_dir: Path, level: str) -> None:
 # Logging helpers
 # ---------------------------------------------------------------------------
 
+def _fmt_size(n: int) -> str:
+    """Format byte count as human-readable size."""
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f}KB"
+    return f"{n / (1024 * 1024):.1f}MB"
+
+
 def log_jsonl(entry: JsonDict) -> None:
     """Append a JSON line to the requests log."""
     path = _log_dir / "requests.jsonl"
     with open(path, "a", opener=lambda p, f: os.open(p, f, 0o600)) as f:
         f.write(json.dumps(entry, default=str) + "\n")
+
+
+def _content_size(content: Any) -> int:
+    """Estimate the size of a message content field in bytes."""
+    if isinstance(content, str):
+        return len(content.encode())
+    return len(json.dumps(content).encode())
+
+
+def summarize_messages(body: JsonDict) -> list[str]:
+    """Return detail lines describing the messages in the request."""
+    messages: list[JsonDict] = body.get("messages", [])
+    lines: list[str] = []
+
+    # System prompt size
+    system = body.get("system")
+    if system:
+        lines.append(f"system: {_fmt_size(_content_size(system))}")
+
+    # Count tools defined
+    tools: list[JsonDict] | None = body.get("tools")
+    if tools:
+        lines.append(f"tools: {len(tools)} defined")
+
+    # Role counts
+    role_counts: dict[str, int] = {}
+    for msg in messages:
+        role: str = msg.get("role", "?")
+        role_counts[role] = role_counts.get(role, 0) + 1
+    if role_counts:
+        parts = [f"{r}={c}" for r, c in role_counts.items()]
+        lines.append(f"messages: {' '.join(parts)}")
+
+    # Tool use summary: count by tool name, and collect Read paths
+    tool_counts: dict[str, int] = {}
+    read_paths: list[str] = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block.get("type") == "tool_use":
+                name: str = block.get("name", "?")
+                tool_counts[name] = tool_counts.get(name, 0) + 1
+                if name == "Read" and isinstance(block.get("input"), dict):
+                    fpath: str = block["input"].get("file_path", "")
+                    if fpath:
+                        read_paths.append(fpath)
+
+    if tool_counts:
+        parts = [f"{name}({count})" for name, count in sorted(tool_counts.items())]
+        lines.append(f"tool_uses: {' '.join(parts)}")
+
+    if read_paths:
+        for p in read_paths:
+            lines.append(f"  read: {p}")
+
+    return lines
 
 
 def summarize_request(body: JsonDict) -> str:
@@ -409,7 +476,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         parsed_body: JsonDict
         body_to_send, parsed_body = rewrite_body(raw_body)
 
-        logger.info(">>> %s %s", self.path, summarize_request(parsed_body))
+        req_size: int = len(body_to_send)
+        logger.info(">>> %s %s (%s)", self.path, summarize_request(parsed_body), _fmt_size(req_size))
+        for detail in summarize_messages(parsed_body):
+            logger.info("    %s", detail)
 
         # Build headers for upstream
         current_token: str = token_manager.get_token()
@@ -490,18 +560,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if b"\n" in chunk:
                         self.wfile.flush()
 
+                resp_size: int = len(collected)
                 elapsed_ms = (time.monotonic() - t0) * 1000
                 decoded_stream: str = collected.decode(errors="replace")
                 stream_text: str = self._extract_stream_text(decoded_stream)
                 logger.info(
-                    "<<< %dms %s",
+                    "<<< %dms %s (%s -> %s)",
                     elapsed_ms,
                     summarize_response(resp.status, None, stream_text),
+                    _fmt_size(req_size), _fmt_size(resp_size),
                 )
                 stream_resp_log: JsonDict = {
                     "status": resp.status,
                     "stream": True,
                     "usage": self._extract_stream_usage(decoded_stream),
+                    "req_bytes": req_size,
+                    "resp_bytes": resp_size,
                 }
                 if _log_requests:
                     stream_resp_log["text_preview"] = stream_text[:500]
@@ -514,6 +588,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 })
             else:
                 resp_data: bytes = resp.read()
+                resp_size = len(resp_data)
                 self.wfile.write(resp_data)
 
                 elapsed_ms = (time.monotonic() - t0) * 1000
@@ -524,13 +599,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     pass
 
                 logger.info(
-                    "<<< %dms %s",
+                    "<<< %dms %s (%s -> %s)",
                     elapsed_ms,
                     summarize_response(resp.status, resp_body, None),
+                    _fmt_size(req_size), _fmt_size(resp_size),
                 )
                 nonstream_resp_log: JsonDict = {
                     "status": resp.status,
                     "stream": False,
+                    "req_bytes": req_size,
+                    "resp_bytes": resp_size,
                 }
                 if resp_body:
                     nonstream_resp_log["usage"] = resp_body.get("usage", {})

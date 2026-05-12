@@ -151,19 +151,93 @@ kill $(lsof -ti:4000)
 | `claude-haiku-4-5`    | `claude-haiku-4.5`    |
 
 Date-stamped variants (e.g. `claude-opus-4-6-20260312`) and base family names
-(e.g. `claude-opus-4`) are also mapped automatically.
+(e.g. `claude-opus-4`) are also mapped automatically. Newer minor versions
+(e.g. `claude-opus-4-7` -> `claude-opus-4.7`) are forwarded through the same
+pattern, but Copilot only accepts versions it actually ships - check with the
+Copilot status page if you get HTTP 400 `model_not_supported`.
+
+## Routing modes
+
+The proxy supports three upstream modes, picked at startup:
+
+1. **Native Anthropic pass-through (default)** - requests go to
+   `api.githubcopilot.com/v1/messages` unchanged. Works for Claude Opus,
+   Sonnet, and Haiku. Auth: `gh auth token`.
+2. **Copilot OpenAI-translated** - `--upstream-model gpt-5-mini` (or
+   `gpt-4.1`, `gemini-2.5-pro`, etc.) routes to
+   `api.githubcopilot.com/chat/completions` with Anthropic <-> OpenAI
+   translation. Requires `--copilot-auth` (one-time device flow).
+   Useful when your Claude premium-request quota is exhausted - `gpt-5-mini`
+   and `gpt-4.1` cost 0x premium requests on Pro plans.
+3. **Local / third-party OpenAI-compatible** - `--upstream-base-url`
+   bypasses Copilot entirely and routes to any OpenAI-compatible endpoint
+   (Ollama, vLLM, etc.) with the same translation. No GitHub auth needed.
+
+### Avoiding Opus quota burn (`--no-opus`)
+
+Opus consumes the highest premium-request multiplier. With `--no-opus`,
+any incoming `claude-opus-*` request is rewritten to `--no-opus-target`
+(default `claude-sonnet-4.6`) before forwarding. Useful when you want to
+keep using Claude Code with its default model selection without burning
+through your monthly Opus quota.
+
+```bash
+./cc-gh-proxy.py --no-opus
+# or pin the target:
+./cc-gh-proxy.py --no-opus --no-opus-target claude-sonnet-4.5
+```
+
+The substitution happens after canonicalization, so date and bracket
+suffixes are handled. Sonnet and Haiku requests pass through unchanged.
+
+### Using a local model (Ollama)
+
+If your Copilot quota is exhausted (and you don't want `gpt-5-mini`), you
+can route through a local Ollama install. Pull a tool-capable model and
+point the proxy at Ollama's OpenAI-compatible endpoint:
+
+```bash
+ollama pull gemma4:26b   # or any tool-capable model
+./cc-gh-proxy.py \
+  --upstream-base-url http://localhost:11434/v1 \
+  --upstream-model gemma4:26b
+```
+
+Caveats:
+- Local models are noticeably slower and weaker at structured tool calls
+  than Claude. Expect a typical Claude Code agent loop to take 5-10x longer.
+- Reasoning models that stream `delta.reasoning` (Gemma 4, DeepSeek-R1)
+  are handled: if `max_tokens` is too small to produce real `content`, the
+  buffered reasoning text is surfaced instead so responses are not silently
+  empty. Bump `max_tokens` to get proper output.
+
+### Using a non-Claude Copilot model
+
+```bash
+./cc-gh-proxy.py --upstream-model gpt-5-mini --copilot-auth
+```
+
+The first run prints a device-flow URL and code; visit GitHub to authorize
+the Copilot OAuth app. The token is cached under `~/.config/cc-gh-proxy/`.
 
 ## Configuration
 
 All options can be set via CLI arguments or environment variables. CLI takes precedence.
 
-| CLI flag       | Environment variable | Default      | Description                              |
-|----------------|----------------------|--------------|------------------------------------------|
-| `-p, --port`   | `PROXY_PORT`         | `4000`       | Port the proxy listens on                |
-| `--host`       | `PROXY_HOST`         | `127.0.0.1`  | Address to bind to                       |
-| `--api-key`    | `PROXY_API_KEY`      | *(none)*     | Require this key via `x-api-key` header  |
-| `--log-dir`    | `PROXY_LOG_DIR`      | `./logs`     | Directory for log files                  |
-| `--log-level`  | `PROXY_LOG_LEVEL`    | `INFO`       | Log level (`DEBUG` for more)             |
+| CLI flag              | Environment variable      | Default               | Description                                                |
+|-----------------------|---------------------------|-----------------------|------------------------------------------------------------|
+| `-p, --port`          | `PROXY_PORT`              | `4000`                | Port the proxy listens on                                  |
+| `--host`              | `PROXY_HOST`              | `127.0.0.1`           | Address to bind to                                         |
+| `--api-key`           | `PROXY_API_KEY`           | *(none)*              | Require this key via `x-api-key` header                    |
+| `--log-dir`           | `PROXY_LOG_DIR`           | `./logs`              | Directory for log files                                    |
+| `--log-level`         | `PROXY_LOG_LEVEL`         | `INFO`                | Log level (`DEBUG` for more)                               |
+| `--log-requests`      | `PROXY_LOG_REQUESTS`      | off                   | Log message text and response bodies (privacy-sensitive)   |
+| `--upstream-model`    | `PROXY_UPSTREAM_MODEL`    | *(none)*              | Force all requests to use this model                       |
+| `--copilot-auth`      | `PROXY_COPILOT_AUTH`      | off                   | Use Copilot OAuth app (required for non-Claude models)     |
+| `--upstream-base-url` | `PROXY_UPSTREAM_BASE_URL` | *(none)*              | OpenAI-compatible base URL (bypasses Copilot)              |
+| `--upstream-api-key`  | `PROXY_UPSTREAM_API_KEY`  | *(none)*              | Bearer token for `--upstream-base-url`                     |
+| `--no-opus`           | `PROXY_NO_OPUS`           | off                   | Rewrite `claude-opus-*` to `--no-opus-target`              |
+| `--no-opus-target`    | `PROXY_NO_OPUS_TARGET`    | `claude-sonnet-4.6`   | Target model for `--no-opus` rewrites                      |
 
 ### API key authentication
 

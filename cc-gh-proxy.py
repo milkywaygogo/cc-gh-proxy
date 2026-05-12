@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -34,6 +35,12 @@ COPILOT_HOST: str = "api.githubcopilot.com"
 COPILOT_OAUTH_CLIENT_ID: str = "Iv1.b507a08c87ecfe98"
 COPILOT_TOKEN_URL: str = "https://api.github.com/copilot_internal/v2/token"
 MAX_BODY_SIZE: int = 10 * 1024 * 1024  # 10 MB
+# Beta features Copilot doesn't support — strip these from anthropic-beta header.
+# Add new prefixes here as Claude releases features Copilot doesn't understand.
+_STRIP_BETA_PREFIXES: tuple[str, ...] = (
+    "context-",          # e.g. context-1m-2025-08-07
+    "advisor-tool-",     # e.g. advisor-tool-2026-03-01
+)
 JsonDict = dict[str, Any]
 
 
@@ -47,6 +54,8 @@ _log_dir: Path = Path()
 _api_key: str | None = None
 _log_requests: bool = False  # Log request/response content (opt-in)
 _upstream_model: str | None = None  # Override model for all requests
+_upstream_base_url: str | None = None  # OpenAI-compatible upstream URL (bypasses Copilot)
+_upstream_api_key: str | None = None  # Bearer token for --upstream-base-url
 
 # ---------------------------------------------------------------------------
 # CLI arguments
@@ -104,6 +113,19 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("PROXY_COPILOT_AUTH", "").lower() in ("1", "true", "yes"),
         help="use Copilot OAuth app for auth (required for non-Claude models). "
              "Performs a one-time device flow on first run (env: PROXY_COPILOT_AUTH)",
+    )
+    p.add_argument(
+        "--upstream-base-url",
+        default=os.environ.get("PROXY_UPSTREAM_BASE_URL"),
+        help="OpenAI-compatible base URL to route requests to instead of Copilot "
+             "(e.g. http://localhost:11434/v1 for Ollama). Bypasses both gh and "
+             "Copilot OAuth. Combine with --upstream-model to set the model name "
+             "(env: PROXY_UPSTREAM_BASE_URL)",
+    )
+    p.add_argument(
+        "--upstream-api-key",
+        default=os.environ.get("PROXY_UPSTREAM_API_KEY"),
+        help="Bearer token for --upstream-base-url (env: PROXY_UPSTREAM_API_KEY)",
     )
     return p.parse_args()
 
@@ -740,6 +762,11 @@ def openai_to_anthropic(oai_resp: JsonDict, model: str) -> JsonDict:
     content: list[JsonDict] = []
     if msg.get("content"):
         content.append({"type": "text", "text": msg["content"]})
+    elif msg.get("reasoning"):
+        # Reasoning models (e.g. Gemma 4 via Ollama) put thinking text in `reasoning`
+        # and may produce no `content` if max_tokens is too small. Surface it as text
+        # so the response is not silently empty.
+        content.append({"type": "text", "text": msg["reasoning"]})
 
     if msg.get("tool_calls"):
         for tc in msg["tool_calls"]:
@@ -824,6 +851,7 @@ def openai_stream_to_anthropic_events(raw: str, model: str) -> str:
 
     content_started: bool = False
     tool_index: int = -1
+    reasoning_buffer: list[str] = []
 
     for chunk in chunks:
         choices: list[JsonDict] = chunk.get("choices", [])
@@ -846,6 +874,10 @@ def openai_stream_to_anthropic_events(raw: str, model: str) -> str:
                 "index": 0,
                 "delta": {"type": "text_delta", "text": delta["content"]},
             }))
+        elif delta.get("reasoning"):
+            # Reasoning models stream thinking text in delta.reasoning. Buffer it
+            # so we can surface it as text if no real content arrives.
+            reasoning_buffer.append(delta["reasoning"])
 
         # Tool calls
         if delta.get("tool_calls"):
@@ -882,6 +914,21 @@ def openai_stream_to_anthropic_events(raw: str, model: str) -> str:
                 "tool_calls": "tool_use",
             }
             stop: str = stop_map.get(choice["finish_reason"], "end_turn")
+
+            # Reasoning fallback: if we buffered reasoning but never started a real
+            # text block (and no tool calls), emit reasoning as text now.
+            if reasoning_buffer and not content_started and tool_index < 0:
+                parts.append(_format_sse("content_block_start", {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }))
+                parts.append(_format_sse("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "".join(reasoning_buffer)},
+                }))
+                content_started = True
 
             total_blocks: int = (1 if content_started else 0) + max(0, tool_index + 1)
             for i in range(total_blocks):
@@ -947,13 +994,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         parsed_body: JsonDict
         body_to_send, parsed_body = rewrite_body(raw_body)
 
-        # Determine the effective upstream model
+        # Determine the effective upstream model and routing
         effective_model: str = _upstream_model or parsed_body.get("model", "")
-        use_openai: bool = _upstream_model is not None and not _is_claude_model(_upstream_model)
+        use_openai: bool = bool(_upstream_base_url) or (
+            _upstream_model is not None and not _is_claude_model(_upstream_model)
+        )
 
         if use_openai:
-            # Override model in body for logging
-            parsed_body["model"] = _upstream_model
+            # Override model in body for logging only when explicitly set
+            if _upstream_model:
+                parsed_body["model"] = _upstream_model
         elif _upstream_model:
             # Force a specific Claude model
             parsed_body["model"] = _upstream_model
@@ -992,7 +1042,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if raw_beta:
             supported = [
                 b.strip() for b in raw_beta.split(",")
-                if not b.strip().startswith("context-")
+                if not b.strip().startswith(_STRIP_BETA_PREFIXES)
             ]
             if supported:
                 upstream_headers["anthropic-beta"] = ", ".join(supported)
@@ -1042,6 +1092,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self, t0: float, parsed_body: JsonDict, model: str,
     ) -> None:
         """Translate to OpenAI format, send to /chat/completions, translate back."""
+        if _upstream_base_url:
+            self._handle_local_openai_path(t0, parsed_body, model)
+            return
         if copilot_token_manager is None:
             self.send_error(503, "Non-Claude models require --copilot-auth")
             logger.error("OpenAI path requested but copilot_token_manager not initialized")
@@ -1185,6 +1238,143 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _handle_local_openai_path(
+        self, t0: float, parsed_body: JsonDict, model: str,
+    ) -> None:
+        """Translate Anthropic -> OpenAI and forward to a local OpenAI-compatible endpoint."""
+        assert _upstream_base_url is not None
+        url = urllib.parse.urlparse(_upstream_base_url)
+        if not url.hostname:
+            self.send_error(500, "Invalid --upstream-base-url")
+            return
+        is_https: bool = url.scheme == "https"
+        port: int = url.port or (443 if is_https else 80)
+        base_path: str = url.path.rstrip("/")
+        full_path: str = f"{base_path}/chat/completions"
+
+        is_stream: bool = parsed_body.get("stream", False)
+        oai_body: JsonDict = anthropic_to_openai(parsed_body, model)
+        oai_bytes: bytes = json.dumps(oai_body).encode()
+        req_size: int = len(oai_bytes)
+
+        upstream_headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Content-Length": str(len(oai_bytes)),
+            "Accept": "text/event-stream" if is_stream else "application/json",
+        }
+        if _upstream_api_key:
+            upstream_headers["Authorization"] = f"Bearer {_upstream_api_key}"
+
+        if is_https:
+            conn = http.client.HTTPSConnection(url.hostname, port=port, context=SSL_CTX)
+        else:
+            conn = http.client.HTTPConnection(url.hostname, port=port)
+
+        try:
+            conn.request("POST", full_path, body=oai_bytes, headers=upstream_headers)
+            resp: http.client.HTTPResponse = conn.getresponse()
+
+            if resp.status != 200:
+                resp_data: bytes = resp.read()
+                self.send_response(resp.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp_data)))
+                self.end_headers()
+                self.wfile.write(resp_data)
+                elapsed_ms: float = (time.monotonic() - t0) * 1000
+                logger.info("<<< %dms HTTP %d (%s -> %s)",
+                            elapsed_ms, resp.status,
+                            _fmt_size(req_size), _fmt_size(len(resp_data)))
+                return
+
+            if is_stream:
+                collected: bytearray = bytearray()
+                while True:
+                    chunk: bytes = resp.read(4096)
+                    if not chunk:
+                        break
+                    collected.extend(chunk)
+
+                oai_raw: str = collected.decode(errors="replace")
+                anthropic_stream: str = openai_stream_to_anthropic_events(oai_raw, model)
+                resp_bytes: bytes = anthropic_stream.encode()
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(resp_bytes)
+                self.wfile.flush()
+
+                resp_size: int = len(resp_bytes)
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                stream_text: str = self._extract_stream_text(anthropic_stream)
+                logger.info(
+                    "<<< %dms %s (%s -> %s)",
+                    elapsed_ms,
+                    summarize_response(200, None, stream_text),
+                    _fmt_size(req_size), _fmt_size(resp_size),
+                )
+                stream_resp_log: JsonDict = {
+                    "status": 200,
+                    "stream": True,
+                    "translated": True,
+                    "upstream": _upstream_base_url,
+                    "usage": self._extract_stream_usage(anthropic_stream),
+                    "req_bytes": req_size,
+                    "resp_bytes": resp_size,
+                }
+                if _log_requests:
+                    stream_resp_log["text_preview"] = stream_text[:500]
+                log_jsonl({
+                    "ts": time.time(),
+                    "path": self.path,
+                    "request": self._request_log_entry(parsed_body),
+                    "response": stream_resp_log,
+                    "elapsed_ms": round(elapsed_ms),
+                })
+            else:
+                resp_data = resp.read()
+                oai_resp: JsonDict = json.loads(resp_data)
+                anthropic_resp: JsonDict = openai_to_anthropic(oai_resp, model)
+                resp_bytes = json.dumps(anthropic_resp).encode()
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp_bytes)))
+                self.end_headers()
+                self.wfile.write(resp_bytes)
+
+                resp_size = len(resp_bytes)
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                logger.info(
+                    "<<< %dms %s (%s -> %s)",
+                    elapsed_ms,
+                    summarize_response(200, anthropic_resp, None),
+                    _fmt_size(req_size), _fmt_size(resp_size),
+                )
+                nonstream_resp_log: JsonDict = {
+                    "status": 200,
+                    "stream": False,
+                    "translated": True,
+                    "upstream": _upstream_base_url,
+                    "req_bytes": req_size,
+                    "resp_bytes": resp_size,
+                }
+                if anthropic_resp:
+                    nonstream_resp_log["usage"] = anthropic_resp.get("usage", {})
+                    nonstream_resp_log["stop_reason"] = anthropic_resp.get("stop_reason")
+                if _log_requests:
+                    nonstream_resp_log["body"] = anthropic_resp
+                log_jsonl({
+                    "ts": time.time(),
+                    "path": self.path,
+                    "request": self._request_log_entry(parsed_body),
+                    "response": nonstream_resp_log,
+                    "elapsed_ms": round(elapsed_ms),
+                })
+        finally:
+            conn.close()
     def _forward_and_log(
         self, resp: http.client.HTTPResponse, is_stream: bool,
         t0: float, req_size: int, parsed_body: JsonDict,
@@ -1367,26 +1557,43 @@ if __name__ == "__main__":
     _api_key = args.api_key
     _log_requests = args.log_requests
     _upstream_model = args.upstream_model
+    _upstream_base_url = args.upstream_base_url
+    _upstream_api_key = args.upstream_api_key
 
     setup_logging(_log_dir, args.log_level)
-    token_manager = TokenManager()
 
-    # Initialize Copilot token manager for non-Claude models
+    # In local-upstream mode we bypass both Copilot paths entirely.
+    token_manager: TokenManager | None = None
     copilot_token_manager: CopilotTokenManager | None = None
-    need_copilot_auth: bool = args.copilot_auth or (
-        _upstream_model is not None and not _is_claude_model(_upstream_model)
-    )
-    if need_copilot_auth:
-        try:
-            copilot_token_manager = CopilotTokenManager()
-        except TokenError as e:
-            logger.error("Copilot auth failed: %s", e)
-            sys.exit(1)
+    if _upstream_base_url:
+        if not _upstream_model:
+            logger.warning(
+                "--upstream-base-url set without --upstream-model; "
+                "request model names will be passed through as-is"
+            )
+    else:
+        token_manager = TokenManager()
+        need_copilot_auth: bool = args.copilot_auth or (
+            _upstream_model is not None and not _is_claude_model(_upstream_model)
+        )
+        if need_copilot_auth:
+            try:
+                copilot_token_manager = CopilotTokenManager()
+            except TokenError as e:
+                logger.error("Copilot auth failed: %s", e)
+                sys.exit(1)
 
     logger.info("cc-gh-proxy starting on http://%s:%d", args.host, args.port)
-    logger.info("  Upstream: %s", COPILOT_HOST)
+    if _upstream_base_url:
+        logger.info("  Upstream: %s (local OpenAI-compatible)", _upstream_base_url)
+        if _upstream_api_key:
+            logger.info("  Upstream API key: configured")
+    else:
+        logger.info("  Upstream: %s", COPILOT_HOST)
     if _upstream_model:
-        if _is_claude_model(_upstream_model):
+        if _upstream_base_url:
+            logger.info("  Upstream model: %s (local)", _upstream_model)
+        elif _is_claude_model(_upstream_model):
             logger.info("  Upstream model: %s (native Anthropic pass-through)", _upstream_model)
         else:
             logger.info("  Upstream model: %s (EXPERIMENTAL: OpenAI translation)", _upstream_model)
@@ -1394,7 +1601,8 @@ if __name__ == "__main__":
         logger.info("  API key: required (x-api-key)")
     else:
         logger.info("  API key: not configured (open access)")
-    logger.info("  Token auto-refresh: every %ds", TokenManager.REFRESH_INTERVAL)
+    if token_manager is not None:
+        logger.info("  Token auto-refresh: every %ds", TokenManager.REFRESH_INTERVAL)
     logger.info("  Logs: %s", _log_dir)
     if _log_requests:
         logger.info("  Request logging: ENABLED (message content will be persisted)")

@@ -56,6 +56,8 @@ _log_requests: bool = False  # Log request/response content (opt-in)
 _upstream_model: str | None = None  # Override model for all requests
 _upstream_base_url: str | None = None  # OpenAI-compatible upstream URL (bypasses Copilot)
 _upstream_api_key: str | None = None  # Bearer token for --upstream-base-url
+_no_opus: bool = False  # Map any claude-opus-* request to a sonnet model
+_no_opus_target: str = "claude-sonnet-4.6"  # Target sonnet model when --no-opus is set
 
 # ---------------------------------------------------------------------------
 # CLI arguments
@@ -126,6 +128,21 @@ def parse_args() -> argparse.Namespace:
         "--upstream-api-key",
         default=os.environ.get("PROXY_UPSTREAM_API_KEY"),
         help="Bearer token for --upstream-base-url (env: PROXY_UPSTREAM_API_KEY)",
+    )
+    p.add_argument(
+        "--no-opus",
+        action="store_true",
+        default=os.environ.get("PROXY_NO_OPUS", "").lower() in ("1", "true", "yes"),
+        help="rewrite any claude-opus-* model to --no-opus-target before "
+             "forwarding. Useful for avoiding the high premium-request cost "
+             "of Opus on GitHub Copilot (env: PROXY_NO_OPUS)",
+    )
+    p.add_argument(
+        "--no-opus-target",
+        default=os.environ.get("PROXY_NO_OPUS_TARGET", "claude-sonnet-4.6"),
+        help="target Copilot model when --no-opus rewrites an Opus request "
+             "(env: PROXY_NO_OPUS_TARGET, default: claude-sonnet-4.6). "
+             "Copilot currently only ships Sonnet 4.6 and 4.5, not 4.7",
     )
     return p.parse_args()
 
@@ -539,6 +556,16 @@ _MODEL_FAMILY_MAP: dict[str, str] = {
 }
 
 
+def _opus_to_sonnet(name: str) -> str:
+    """If --no-opus is enabled, rewrite any claude-opus-* model to the configured
+    sonnet target. Version is NOT preserved because Copilot does not ship a sonnet
+    for every opus version (e.g. opus 4.7 has no matching sonnet 4.7)."""
+    if _no_opus and name.startswith("claude-opus-"):
+        logger.info("Downgrading %s -> %s (--no-opus)", name, _no_opus_target)
+        return _no_opus_target
+    return name
+
+
 def map_model_name(model: str) -> str:
     """Map Anthropic model IDs to Copilot model names.
 
@@ -551,24 +578,24 @@ def map_model_name(model: str) -> str:
     model = re.sub(r"\[[^\]]*\]$", "", model)
 
     if model in _MODEL_STATIC_MAP:
-        return _MODEL_STATIC_MAP[model]
+        return _opus_to_sonnet(_MODEL_STATIC_MAP[model])
 
     # Strip date suffixes: claude-opus-4-6-20260312 -> claude-opus-4-6
     stripped: str = re.sub(r"-\d{8}$", "", model)
     if stripped in _MODEL_STATIC_MAP:
-        return _MODEL_STATIC_MAP[stripped]
+        return _opus_to_sonnet(_MODEL_STATIC_MAP[stripped])
 
     # Pattern: claude-{tier}-{major}-{minor} -> claude-{tier}-{major}.{minor}
     m = re.match(r"^(claude-(?:opus|sonnet|haiku)-\d+)-(\d+)$", stripped)
     if m:
-        return f"{m.group(1)}.{m.group(2)}"
+        return _opus_to_sonnet(f"{m.group(1)}.{m.group(2)}")
 
     # Base family: claude-opus-4 -> claude-opus-4.6 (latest known)
     if stripped in _MODEL_FAMILY_MAP:
-        return _MODEL_FAMILY_MAP[stripped]
+        return _opus_to_sonnet(_MODEL_FAMILY_MAP[stripped])
 
     logger.warning("Unknown model '%s', passing through as-is", model)
-    return model
+    return _opus_to_sonnet(model)
 
 
 # ---------------------------------------------------------------------------
@@ -1559,6 +1586,8 @@ if __name__ == "__main__":
     _upstream_model = args.upstream_model
     _upstream_base_url = args.upstream_base_url
     _upstream_api_key = args.upstream_api_key
+    _no_opus = args.no_opus
+    _no_opus_target = args.no_opus_target
 
     setup_logging(_log_dir, args.log_level)
 
@@ -1601,6 +1630,8 @@ if __name__ == "__main__":
         logger.info("  API key: required (x-api-key)")
     else:
         logger.info("  API key: not configured (open access)")
+    if _no_opus:
+        logger.info("  Opus downgrade: ENABLED (claude-opus-* -> %s)", _no_opus_target)
     if token_manager is not None:
         logger.info("  Token auto-refresh: every %ds", TokenManager.REFRESH_INTERVAL)
     logger.info("  Logs: %s", _log_dir)

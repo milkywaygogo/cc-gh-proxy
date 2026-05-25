@@ -32,6 +32,8 @@ from socketserver import ThreadingMixIn
 from typing import Any
 
 COPILOT_HOST: str = "api.githubcopilot.com"
+TAVILY_HOST: str = "api.tavily.com"
+TAVILY_PRICING: dict[str, float] = {"basic": 0.005, "advanced": 0.008}
 COPILOT_OAUTH_CLIENT_ID: str = "Iv1.b507a08c87ecfe98"
 COPILOT_TOKEN_URL: str = "https://api.github.com/copilot_internal/v2/token"
 MAX_BODY_SIZE: int = 10 * 1024 * 1024  # 10 MB
@@ -58,6 +60,16 @@ _upstream_base_url: str | None = None  # OpenAI-compatible upstream URL (bypasse
 _upstream_api_key: str | None = None  # Bearer token for --upstream-base-url
 _no_opus: bool = False  # Map any claude-opus-* request to a sonnet model
 _no_opus_target: str = "claude-sonnet-4.6"  # Target sonnet model when --no-opus is set
+
+# Tavily configuration. When set, Claude Code's "WebSearch executor" requests
+# (the small follow-up call CC fires with tools=[web_search_*]) are served by
+# Tavily instead of Copilot — Tavily handles the actual web search and returns
+# extracted page content inline so the model rarely needs follow-up WebFetch.
+_tavily_api_key: str | None = None
+_tavily_search_depth: str = "advanced"  # "basic" or "advanced"
+_tavily_max_results: int = 5
+_tavily_spend_lock: threading.Lock = threading.Lock()
+_tavily_spend: dict[str, float] = {}
 
 # ---------------------------------------------------------------------------
 # CLI arguments
@@ -128,6 +140,30 @@ def parse_args() -> argparse.Namespace:
         "--upstream-api-key",
         default=os.environ.get("PROXY_UPSTREAM_API_KEY"),
         help="Bearer token for --upstream-base-url (env: PROXY_UPSTREAM_API_KEY)",
+    )
+    p.add_argument(
+        "--tavily-api-key",
+        default=os.environ.get("PROXY_TAVILY_API_KEY"),
+        help="Tavily API key. When set, requests whose `tools` contains ONLY "
+             "`web_search_*` / `web_fetch_*` server tools (Claude Code's "
+             "WebSearch executor) are served by Tavily. Tavily returns "
+             "extracted page content in search results, so the model rarely "
+             "needs follow-up WebFetch (env: PROXY_TAVILY_API_KEY)",
+    )
+    p.add_argument(
+        "--tavily-search-depth",
+        choices=("basic", "advanced"),
+        default=os.environ.get("PROXY_TAVILY_SEARCH_DEPTH", "advanced"),
+        help="Tavily search depth. 'advanced' ($0.008/search) returns "
+             "extracted page content; 'basic' ($0.005/search) returns snippets "
+             "only (env: PROXY_TAVILY_SEARCH_DEPTH, default: advanced)",
+    )
+    p.add_argument(
+        "--tavily-max-results",
+        type=int,
+        default=int(os.environ.get("PROXY_TAVILY_MAX_RESULTS", "5")),
+        help="Maximum results per Tavily search "
+             "(env: PROXY_TAVILY_MAX_RESULTS, default: 5)",
     )
     p.add_argument(
         "--no-opus",
@@ -677,6 +713,138 @@ def _is_claude_model(model: str) -> bool:
     return model.startswith("claude-")
 
 
+def _today_str() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def _is_pure_websearch_request(body: JsonDict) -> bool:
+    """True if `tools` is non-empty and every entry is a web_search_* or
+    web_fetch_* server tool. This is the Tavily-eligible subset of the
+    "pure server-tool" pattern."""
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            return False
+        ttype = tool.get("type")
+        if not isinstance(ttype, str):
+            return False
+        if not (ttype.startswith("web_search_") or ttype.startswith("web_fetch_")):
+            return False
+    return True
+
+
+def _extract_search_query(body: JsonDict) -> str:
+    """Pull the user's search query out of an executor-pattern request body.
+
+    Claude Code puts the query verbatim in the last user message's content,
+    either as a plain string or as a list of `{type:"text", text:...}` blocks.
+    """
+    messages = body.get("messages", [])
+    if not isinstance(messages, list) or not messages:
+        return ""
+    last = messages[-1]
+    if not isinstance(last, dict):
+        return ""
+    content = last.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        texts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                t = block.get("text", "")
+                if isinstance(t, str):
+                    texts.append(t)
+        return " ".join(texts).strip()
+    return ""
+
+
+def _tavily_search(query: str) -> JsonDict:
+    """Synchronous Tavily search call. Raises on transport / non-200."""
+    import urllib.request
+    import urllib.error
+
+    payload: bytes = json.dumps({
+        "api_key": _tavily_api_key,
+        "query": query,
+        "search_depth": _tavily_search_depth,
+        "max_results": _tavily_max_results,
+        "include_answer": False,
+        "include_raw_content": False,
+        "include_images": False,
+    }).encode()
+    req = urllib.request.Request(
+        f"https://{TAVILY_HOST}/search",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30, context=SSL_CTX) as resp:
+        return json.loads(resp.read())
+
+
+def _tavily_to_search_results(data: JsonDict) -> list[JsonDict]:
+    """Map Tavily `results` into Anthropic `web_search_result` blocks.
+
+    Anthropic's native shape uses an opaque `encrypted_content` blob — we
+    stuff the extracted page content there so the model has the same field
+    layout it expects. `page_age` is left null since Tavily doesn't expose it.
+    """
+    out: list[JsonDict] = []
+    raw = data.get("results") or []
+    if not isinstance(raw, list):
+        return out
+    for r in raw:
+        if not isinstance(r, dict):
+            continue
+        out.append({
+            "type": "web_search_result",
+            "url": r.get("url") or "",
+            "title": r.get("title") or "",
+            "encrypted_content": (r.get("content") or "").strip(),
+            "page_age": None,
+        })
+    return out
+
+
+def _format_tavily_results(query: str, data: JsonDict) -> str:
+    """Format a Tavily response as Markdown for injection back into CC."""
+    parts: list[str] = [f"# Search results for: {query}\n"]
+    answer = data.get("answer")
+    if isinstance(answer, str) and answer.strip():
+        parts.append(f"**Answer:** {answer.strip()}\n")
+    results = data.get("results") or []
+    if not isinstance(results, list) or not results:
+        parts.append("_No results._")
+        return "\n".join(parts)
+    for i, r in enumerate(results, 1):
+        if not isinstance(r, dict):
+            continue
+        title = r.get("title") or "(no title)"
+        url = r.get("url") or ""
+        content = (r.get("content") or "").strip()
+        parts.append(f"\n## {i}. [{title}]({url})\n")
+        if content:
+            parts.append(content)
+    return "\n".join(parts)
+
+
+def _tavily_spend_today() -> float:
+    with _tavily_spend_lock:
+        return _tavily_spend.get(_today_str(), 0.0)
+
+
+def _record_tavily_spend(usd: float) -> float:
+    with _tavily_spend_lock:
+        today = _today_str()
+        _tavily_spend[today] = _tavily_spend.get(today, 0.0) + usd
+        return _tavily_spend[today]
+
+
 def anthropic_to_openai(body: JsonDict, model: str) -> JsonDict:
     """Convert Anthropic Messages API request to OpenAI Chat Completions format."""
     messages: list[JsonDict] = []
@@ -1016,6 +1184,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         raw_body: bytes = self.rfile.read(content_length)
 
+        # Tavily routing: when configured, intercept Claude Code's "WebSearch
+        # executor" pattern (a request whose `tools` contains ONLY
+        # web_search_*/web_fetch_* server tools) and serve it from Tavily.
+        # Mixed requests (server tool alongside Read/Bash/...) stay on Copilot.
+        pre_parsed: JsonDict | None = None
+        if _tavily_api_key is not None:
+            try:
+                pre_parsed = json.loads(raw_body)
+            except json.JSONDecodeError:
+                self.send_error(400, "Invalid JSON")
+                return
+
+        if (
+            _tavily_api_key is not None
+            and pre_parsed is not None
+            and _is_pure_websearch_request(pre_parsed)
+        ):
+            req_size: int = len(raw_body)
+            logger.info(
+                ">>> %s %s (%s) [tavily]",
+                self.path, summarize_request(pre_parsed), _fmt_size(req_size),
+            )
+            for detail in summarize_messages(pre_parsed):
+                logger.info("    %s", detail)
+            self._handle_tavily_path(t0, raw_body, pre_parsed)
+            return
+
         # Rewrite model name and strip unsupported fields
         body_to_send: bytes
         parsed_body: JsonDict
@@ -1046,6 +1241,221 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._handle_openai_path(t0, parsed_body, effective_model)
         else:
             self._handle_native_path(t0, body_to_send, parsed_body)
+
+    def _handle_tavily_path(
+        self, t0: float, raw_body: bytes, parsed_body: JsonDict,
+    ) -> None:
+        """Serve a CC WebSearch executor request from Tavily.
+
+        Replaces the upstream call entirely: we extract the search query,
+        call Tavily, and synthesize a streaming Anthropic-format response
+        containing one `text` block of Markdown-formatted search results
+        with extracted page content. CC folds this back into the main
+        Copilot turn as a `tool_result`, and the model can answer without
+        any follow-up WebFetch.
+        """
+        assert _tavily_api_key is not None
+        req_size: int = len(raw_body)
+
+        query: str = _extract_search_query(parsed_body)
+        if not query:
+            self.send_error(400, "Could not extract search query from request")
+            logger.warning("Refused [tavily]: empty search query")
+            return
+
+        try:
+            tavily_resp: JsonDict = _tavily_search(query)
+        except Exception as e:
+            logger.exception("Tavily call failed")
+            err_msg = f"Tavily error: {e}"
+            self.send_error(502, err_msg)
+            return
+
+        cost: float = TAVILY_PRICING.get(_tavily_search_depth, 0.01)
+        today_total: float = _record_tavily_spend(cost)
+
+        is_stream: bool = bool(parsed_body.get("stream", False))
+        model: str = parsed_body.get("model") or "claude-tavily"
+        n_results: int = len(tavily_resp.get("results") or [])
+
+        msg_id: str = f"msg_tavily_{int(time.time() * 1000)}"
+        tool_use_id: str = f"srvtoolu_{int(time.time() * 1000)}"
+        search_results: list[JsonDict] = _tavily_to_search_results(tavily_resp)
+        summary_text: str = _format_tavily_results(query, tavily_resp)
+        usage: JsonDict = {
+            "input_tokens": 0,
+            "output_tokens": max(1, len(summary_text) // 4),
+            "server_tool_use": {"web_search_requests": 1 if n_results else 0},
+        }
+
+        if is_stream:
+            sse_body: bytes = self._tavily_to_anthropic_sse(
+                msg_id, tool_use_id, query, search_results, summary_text,
+                model, usage,
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(sse_body)
+            self.wfile.flush()
+            resp_size: int = len(sse_body)
+        else:
+            non_stream_body: JsonDict = {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [
+                    {
+                        "type": "server_tool_use",
+                        "id": tool_use_id,
+                        "name": "web_search",
+                        "input": {"query": query},
+                    },
+                    {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": search_results,
+                    },
+                    {"type": "text", "text": summary_text},
+                ],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": usage,
+            }
+            ns_bytes: bytes = json.dumps(non_stream_body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(ns_bytes)))
+            self.end_headers()
+            self.wfile.write(ns_bytes)
+            resp_size = len(ns_bytes)
+
+        elapsed_ms: float = (time.monotonic() - t0) * 1000
+        logger.info(
+            "<<< %dms OK [tavily] (%s -> %s) results=%d",
+            elapsed_ms, _fmt_size(req_size), _fmt_size(resp_size), n_results,
+        )
+        logger.info(
+            "    cost: $%.4f  today: $%.2f", cost, today_total,
+        )
+
+        log_jsonl({
+            "ts": time.time(),
+            "path": self.path,
+            "request": self._request_log_entry(parsed_body),
+            "response": {
+                "status": 200,
+                "stream": is_stream,
+                "tavily": True,
+                "search_depth": _tavily_search_depth,
+                "results": n_results,
+                "query": query[:200],
+                "req_bytes": req_size,
+                "resp_bytes": resp_size,
+                "cost_usd": round(cost, 4),
+                "spend_today_usd": round(today_total, 4),
+            },
+            "elapsed_ms": round(elapsed_ms),
+        })
+
+    @staticmethod
+    def _tavily_to_anthropic_sse(
+        msg_id: str,
+        tool_use_id: str,
+        query: str,
+        search_results: list[JsonDict],
+        summary_text: str,
+        model: str,
+        usage: JsonDict,
+    ) -> str:
+        """Build a synthetic Anthropic-format SSE stream that mimics a real
+        `web_search` server-tool turn. Emits three content blocks:
+
+          0. `server_tool_use`           — the tool invocation
+          1. `web_search_tool_result`    — Anthropic-shaped result list
+          2. `text`                      — Markdown summary (fallback for
+                                            consumers that ignore the result
+                                            block)
+
+        This shape lets Claude Code's executor count the search and feed the
+        structured results back to the main agent.
+        """
+        parts: list[str] = []
+        parts.append(_format_sse("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        }))
+
+        parts.append(_format_sse("content_block_start", {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": tool_use_id,
+                "name": "web_search",
+                "input": {},
+            },
+        }))
+        parts.append(_format_sse("content_block_delta", {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps({"query": query}),
+            },
+        }))
+        parts.append(_format_sse("content_block_stop", {
+            "type": "content_block_stop", "index": 0,
+        }))
+
+        parts.append(_format_sse("content_block_start", {
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
+                "content": search_results,
+            },
+        }))
+        parts.append(_format_sse("content_block_stop", {
+            "type": "content_block_stop", "index": 1,
+        }))
+
+        text: str = summary_text or "_(no results)_"
+        parts.append(_format_sse("content_block_start", {
+            "type": "content_block_start",
+            "index": 2,
+            "content_block": {"type": "text", "text": ""},
+        }))
+        chunk_size: int = 4096
+        for i in range(0, len(text), chunk_size):
+            parts.append(_format_sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {"type": "text_delta", "text": text[i:i + chunk_size]},
+            }))
+        parts.append(_format_sse("content_block_stop", {
+            "type": "content_block_stop", "index": 2,
+        }))
+
+        parts.append(_format_sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": usage,
+        }))
+        parts.append(_format_sse("message_stop", {"type": "message_stop"}))
+        return "".join(parts)
 
     def _handle_native_path(
         self, t0: float, body_to_send: bytes, parsed_body: JsonDict,
@@ -1429,10 +1839,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 summarize_response(resp.status, None, stream_text),
                 _fmt_size(req_size), _fmt_size(resp_size),
             )
+            stream_usage: JsonDict = self._extract_stream_usage(decoded_stream)
             stream_resp_log: JsonDict = {
                 "status": resp.status,
                 "stream": True,
-                "usage": self._extract_stream_usage(decoded_stream),
+                "usage": stream_usage,
                 "req_bytes": req_size,
                 "resp_bytes": resp_size,
             }
@@ -1588,6 +1999,9 @@ if __name__ == "__main__":
     _upstream_api_key = args.upstream_api_key
     _no_opus = args.no_opus
     _no_opus_target = args.no_opus_target
+    _tavily_api_key = args.tavily_api_key
+    _tavily_search_depth = args.tavily_search_depth
+    _tavily_max_results = args.tavily_max_results
 
     setup_logging(_log_dir, args.log_level)
 
@@ -1632,6 +2046,11 @@ if __name__ == "__main__":
         logger.info("  API key: not configured (open access)")
     if _no_opus:
         logger.info("  Opus downgrade: ENABLED (claude-opus-* -> %s)", _no_opus_target)
+    if _tavily_api_key:
+        logger.info(
+            "  Tavily search: ENABLED -> %s (depth=%s, max_results=%d)",
+            TAVILY_HOST, _tavily_search_depth, _tavily_max_results,
+        )
     if token_manager is not None:
         logger.info("  Token auto-refresh: every %ds", TokenManager.REFRESH_INTERVAL)
     logger.info("  Logs: %s", _log_dir)

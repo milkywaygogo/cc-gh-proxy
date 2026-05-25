@@ -220,6 +220,47 @@ Caveats:
 The first run prints a device-flow URL and code; visit GitHub to authorize
 the Copilot OAuth app. The token is cached under `~/.config/cc-gh-proxy/`.
 
+### WebSearch via Tavily
+
+GitHub Copilot **does not execute Anthropic's server-side tools** like
+`web_search_20250305` / `web_fetch_20250305`. As a result, Claude Code's
+`WebSearch` returns "Did 0 searches" when routed through Copilot.
+
+Pass `--tavily-api-key` and the proxy will intercept Claude Code's
+WebSearch sub-call and serve it from [Tavily](https://tavily.com) instead:
+
+```bash
+./cc-gh-proxy.py --tavily-api-key tvly-...
+```
+
+How it works:
+1. Claude Code fires a small executor request whose `tools` list contains
+   only `web_search_*` / `web_fetch_*` (no `Read`, `Bash`, etc.). The proxy
+   recognizes this exact shape and intercepts it before reaching Copilot.
+2. The user's query is extracted from the last message and sent to Tavily.
+3. The Tavily response is repackaged as a streaming Anthropic SSE turn with
+   three content blocks: `server_tool_use` (so Claude Code's UI reports
+   `Did N searches`), `web_search_tool_result` (the structured results, with
+   Tavily's extracted page content in `encrypted_content`), and a text
+   block with a Markdown summary as fallback.
+4. Mixed requests (server tool injected alongside client tools) stay on
+   Copilot — those are normal conversation turns and don't need Tavily.
+
+Pricing: `$0.008` per `advanced` search, `$0.005` per `basic`. Each Tavily
+call is logged to `requests.jsonl` as `"tavily": true` with `cost_usd` and
+`spend_today_usd` running totals.
+
+Why Tavily and not direct Anthropic web_search? Anthropic charges `$10 / 1k`
+searches (~30x more expensive) and Claude Code's `WebFetch` follow-ups
+often fail on bot-protected hosts (Microsoft Learn, Azure docs, etc.). The
+`advanced` Tavily mode returns extracted page content inline, so the model
+typically doesn't need to issue a follow-up `WebFetch` at all.
+
+Note: `WebFetch` is a client-side Claude Code tool — it runs from your
+local machine and never traverses the proxy. Socket / TLS errors on
+`WebFetch` are network-side (often bot mitigation) and cannot be fixed by
+the proxy.
+
 ## Configuration
 
 All options can be set via CLI arguments or environment variables. CLI takes precedence.
@@ -238,6 +279,9 @@ All options can be set via CLI arguments or environment variables. CLI takes pre
 | `--upstream-api-key`  | `PROXY_UPSTREAM_API_KEY`  | *(none)*              | Bearer token for `--upstream-base-url`                     |
 | `--no-opus`           | `PROXY_NO_OPUS`           | off                   | Rewrite `claude-opus-*` to `--no-opus-target`              |
 | `--no-opus-target`    | `PROXY_NO_OPUS_TARGET`    | `claude-sonnet-4.6`   | Target model for `--no-opus` rewrites                      |
+| `--tavily-api-key`    | `PROXY_TAVILY_API_KEY`    | *(none)*              | Enable Tavily WebSearch interception (see below)           |
+| `--tavily-search-depth` | `PROXY_TAVILY_SEARCH_DEPTH` | `advanced`        | Tavily depth: `basic` ($0.005) or `advanced` ($0.008)      |
+| `--tavily-max-results` | `PROXY_TAVILY_MAX_RESULTS` | `5`                  | Maximum results per Tavily search                          |
 
 ### API key authentication
 

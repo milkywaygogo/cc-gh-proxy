@@ -1000,6 +1000,201 @@ def _format_sse(event: str, data: JsonDict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+def _stream_responses_to_chat_completions(
+    resp: http.client.HTTPResponse, wfile: Any, model: str,
+) -> int:
+    """Translate an OpenAI Responses-API SSE stream to a Chat-Completions SSE
+    stream, writing chunks to `wfile` as they're produced. Returns total bytes
+    written.
+
+    Used when a client (e.g. Cursor) sends a Responses-API body to
+    /v1/chat/completions but expects to read back a chat-completion SSE stream.
+    Translation is incremental — each upstream event is converted and flushed
+    immediately, so token-level latency is preserved.
+    """
+    chat_id: str = f"chatcmpl-{int(time.time() * 1000)}"
+    created: int = int(time.time())
+    bytes_written: int = 0
+
+    # State shared across events
+    state: dict[str, Any] = {
+        "tool_indices": {},     # output_index/item_id -> tool_call index
+        "next_tool_index": 0,
+        "sent_role": False,
+        "saw_tool_call": False,
+        "finish_reason": "stop",
+    }
+
+    def emit(
+        delta: JsonDict,
+        finish_reason: str | None = None,
+        usage: JsonDict | None = None,
+    ) -> None:
+        nonlocal bytes_written
+        chunk: JsonDict = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }],
+        }
+        if usage is not None:
+            chunk["usage"] = usage
+        line: bytes = f"data: {json.dumps(chunk)}\n\n".encode()
+        try:
+            wfile.write(line)
+            wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+        bytes_written += len(line)
+
+    def handle_event(event_type: str, data: JsonDict) -> None:
+        if event_type == "response.created" or event_type == "response.in_progress":
+            if not state["sent_role"]:
+                emit({"role": "assistant", "content": ""})
+                state["sent_role"] = True
+            return
+
+        if event_type == "response.output_text.delta":
+            text: str = data.get("delta", "")
+            if text:
+                emit({"content": text})
+            return
+
+        if event_type == "response.output_item.added":
+            item: JsonDict = data.get("item", {}) or {}
+            if item.get("type") == "function_call":
+                # Key by output_index when present (multiple parallel tool calls)
+                key: str = (
+                    str(data.get("output_index"))
+                    if data.get("output_index") is not None
+                    else (item.get("id") or item.get("call_id") or "")
+                )
+                if key not in state["tool_indices"]:
+                    idx: int = state["next_tool_index"]
+                    state["tool_indices"][key] = idx
+                    state["next_tool_index"] += 1
+                    state["saw_tool_call"] = True
+                    emit({
+                        "tool_calls": [{
+                            "index": idx,
+                            "id": item.get("call_id") or item.get("id") or "",
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name", ""),
+                                "arguments": "",
+                            },
+                        }],
+                    })
+            return
+
+        if event_type == "response.function_call_arguments.delta":
+            key = (
+                str(data.get("output_index"))
+                if data.get("output_index") is not None
+                else (data.get("item_id") or "")
+            )
+            idx_opt: int | None = state["tool_indices"].get(key)
+            if idx_opt is None:
+                # Some streams emit args without a prior output_item.added —
+                # allocate an index on the fly.
+                idx_opt = state["next_tool_index"]
+                state["tool_indices"][key] = idx_opt
+                state["next_tool_index"] += 1
+                state["saw_tool_call"] = True
+            delta_str: str = data.get("delta", "")
+            if delta_str:
+                emit({
+                    "tool_calls": [{
+                        "index": idx_opt,
+                        "function": {"arguments": delta_str},
+                    }],
+                })
+            return
+
+        if event_type == "response.completed":
+            resp_obj: JsonDict = data.get("response", {}) or {}
+            u: JsonDict = resp_obj.get("usage", {}) or {}
+            usage: JsonDict | None = None
+            if u:
+                usage = {
+                    "prompt_tokens": u.get("input_tokens", 0),
+                    "completion_tokens": u.get("output_tokens", 0),
+                    "total_tokens": u.get(
+                        "total_tokens",
+                        u.get("input_tokens", 0) + u.get("output_tokens", 0),
+                    ),
+                }
+            finish: str = "tool_calls" if state["saw_tool_call"] else "stop"
+            emit({}, finish_reason=finish, usage=usage)
+            return
+
+        if event_type == "response.incomplete":
+            # Hit max_output_tokens, content_filter, etc.
+            reason_obj: JsonDict = (data.get("response", {}) or {}).get(
+                "incomplete_details", {}
+            ) or {}
+            reason: str = reason_obj.get("reason", "")
+            finish_map: dict[str, str] = {
+                "max_output_tokens": "length",
+                "content_filter": "content_filter",
+            }
+            emit({}, finish_reason=finish_map.get(reason, "stop"))
+            return
+
+        if event_type in ("response.failed", "error"):
+            emit({}, finish_reason="stop")
+            return
+
+    # Incremental SSE parser. Read raw bytes, split on \n\n event boundaries.
+    buf: bytes = b""
+    try:
+        while True:
+            chunk_bytes: bytes = resp.read(4096)
+            if not chunk_bytes:
+                break
+            buf += chunk_bytes
+            while b"\n\n" in buf:
+                raw_event, buf = buf.split(b"\n\n", 1)
+                event_type: str = ""
+                data_lines: list[str] = []
+                for line in raw_event.split(b"\n"):
+                    if line.startswith(b"event:"):
+                        event_type = line[6:].strip().decode("utf-8", "replace")
+                    elif line.startswith(b"data:"):
+                        data_lines.append(
+                            line[5:].lstrip().decode("utf-8", "replace")
+                        )
+                if not data_lines:
+                    continue
+                data_str: str = "\n".join(data_lines)
+                if data_str == "[DONE]":
+                    continue
+                try:
+                    event_data: JsonDict = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if not event_type:
+                    event_type = event_data.get("type", "")
+                handle_event(event_type, event_data)
+    except (BrokenPipeError, ConnectionResetError):
+        return bytes_written
+
+    # Closing [DONE] sentinel
+    try:
+        done_line: bytes = b"data: [DONE]\n\n"
+        wfile.write(done_line)
+        wfile.flush()
+        bytes_written += len(done_line)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    return bytes_written
+
+
 def openai_stream_to_anthropic_events(raw: str, model: str) -> str:
     """Convert collected OpenAI SSE stream to Anthropic SSE stream."""
     chunks: list[JsonDict] = []
@@ -1159,19 +1354,44 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _check_api_key(self) -> bool:
+        """Validate proxy --api-key from x-api-key or Authorization: Bearer.
+
+        Cursor and other OpenAI-compatible clients send Authorization: Bearer,
+        Claude Code sends x-api-key. Accept either.
+        """
+        if not _api_key:
+            return True
+        client_key: str = self.headers.get("x-api-key", "")
+        if not client_key:
+            auth: str = self.headers.get("Authorization", "")
+            if auth.lower().startswith("bearer "):
+                client_key = auth[7:].strip()
+        if not hmac.compare_digest(client_key, _api_key):
+            self.send_error(401, "Invalid or missing API key")
+            logger.warning("Rejected request: bad api key")
+            return False
+        return True
+
     def _handle_post(self) -> None:
-        # Only allow the Anthropic messages endpoint
+        # Dispatch by path. Anthropic Messages on /v1/messages; OpenAI Chat
+        # Completions passthrough on /chat/completions and /v1/chat/completions.
+        if self.path.startswith("/chat/completions") or self.path.startswith("/v1/chat/completions"):
+            if not self._check_api_key():
+                return
+            self._handle_chat_passthrough()
+            return
+        if self.path.startswith("/responses") or self.path.startswith("/v1/responses"):
+            if not self._check_api_key():
+                return
+            self._handle_responses_passthrough()
+            return
         if not self.path.startswith("/v1/messages"):
             self.send_error(404, "Not found")
             return
 
-        # Check API key if configured
-        if _api_key:
-            client_key: str = self.headers.get("x-api-key", "")
-            if not hmac.compare_digest(client_key, _api_key):
-                self.send_error(401, "Invalid or missing API key")
-                logger.warning("Rejected request: bad x-api-key")
-                return
+        if not self._check_api_key():
+            return
 
         t0: float = time.monotonic()
         try:
@@ -1241,6 +1461,319 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._handle_openai_path(t0, parsed_body, effective_model)
         else:
             self._handle_native_path(t0, body_to_send, parsed_body)
+
+    def _handle_chat_passthrough(self) -> None:
+        """Forward OpenAI /chat/completions requests to Copilot unchanged.
+
+        Used by Cursor and other OpenAI-compatible clients. Auth header is
+        swapped for the Copilot OAuth token; body and response are forwarded
+        as-is (no Anthropic/OpenAI translation).
+        """
+        if copilot_token_manager is None:
+            self.send_error(503, "/chat/completions passthrough requires --copilot-auth")
+            logger.error("/chat/completions hit but copilot_token_manager not initialized")
+            return
+
+        t0: float = time.monotonic()
+        try:
+            content_length: int = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(400, "Invalid Content-Length")
+            return
+        if content_length > MAX_BODY_SIZE:
+            self.send_error(413, "Request body too large")
+            return
+        raw_body: bytes = self.rfile.read(content_length)
+        req_size: int = len(raw_body)
+
+        # Best-effort parse for logging only; bytes are forwarded as-is.
+        model: str = ""
+        is_stream: bool = False
+        n_messages: int = 0
+        peek: JsonDict | None = None
+        try:
+            peek = json.loads(raw_body) if raw_body else {}
+            if isinstance(peek, dict):
+                model = str(peek.get("model", ""))
+                is_stream = bool(peek.get("stream", False))
+                msgs = peek.get("messages")
+                if isinstance(msgs, list):
+                    n_messages = len(msgs)
+        except json.JSONDecodeError:
+            pass
+
+        logger.info(
+            ">>> %s model=%s stream=%s msgs=%d (%s) [chat-passthrough]",
+            self.path, model or "?", is_stream, n_messages, _fmt_size(req_size),
+        )
+
+        # Cursor (and some other clients) hard-route GPT-5.x / reasoning
+        # models to /chat/completions but send a Responses-API-style body
+        # (`input` instead of `messages`, plus `reasoning`, `text`, `store`,
+        # etc.). Copilot's /chat/completions then rejects it with the
+        # cryptic "messages must be non-empty". Detect this shape and
+        # internally re-route to Copilot's /responses endpoint instead.
+        if (
+            n_messages == 0
+            and isinstance(peek, dict)
+            and "input" in peek
+        ):
+            logger.info(
+                "chat-passthrough body looks like Responses API "
+                "(keys=%s) — rerouting to /responses (translate=%s)",
+                sorted(peek.keys()), is_stream,
+            )
+            self._forward_responses_passthrough(
+                t0, raw_body, model, is_stream,
+                translate_to_chat=True,
+            )
+            return
+
+        # Plain empty-messages body that isn't Responses-API-shaped:
+        # surface a useful warning so the user can debug their client.
+        if n_messages == 0 and isinstance(peek, dict):
+            logger.warning(
+                "chat-passthrough request has empty/missing `messages` "
+                "(keys=%s). This will likely fail with "
+                "\"messages must be non-empty\".",
+                sorted(peek.keys()),
+            )
+
+        def _build_headers(token: str) -> dict[str, str]:
+            return {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Content-Length": str(req_size),
+                "Editor-Version": "vscode/1.96.0",
+                "Editor-Plugin-Version": "copilot/1.200.0",
+                "User-Agent": "GithubCopilot/1.200.0",
+                "Copilot-Integration-Id": "vscode-chat",
+                "Accept": "text/event-stream" if is_stream else "application/json",
+            }
+
+        current_token: str = copilot_token_manager.get_token()
+        conn = http.client.HTTPSConnection(COPILOT_HOST, context=SSL_CTX)
+        try:
+            conn.request(
+                "POST", "/chat/completions",
+                body=raw_body, headers=_build_headers(current_token),
+            )
+            resp: http.client.HTTPResponse = conn.getresponse()
+
+            if resp.status in (401, 403):
+                logger.warning("Got %d on /chat/completions, refreshing token", resp.status)
+                resp.read()
+                conn.close()
+                new_token: str = copilot_token_manager.invalidate()
+                conn = http.client.HTTPSConnection(COPILOT_HOST, context=SSL_CTX)
+                conn.request(
+                    "POST", "/chat/completions",
+                    body=raw_body, headers=_build_headers(new_token),
+                )
+                resp = conn.getresponse()
+
+            # Forward status and content-type. Stream bytes through.
+            content_type: str = resp.getheader("Content-Type") or "application/json"
+            self.send_response(resp.status)
+            self.send_header("Content-Type", content_type)
+            if "event-stream" in content_type:
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                resp_size: int = 0
+                while True:
+                    chunk: bytes = resp.read(4096)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    resp_size += len(chunk)
+                    if b"\n" in chunk:
+                        self.wfile.flush()
+            else:
+                data: bytes = resp.read()
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                resp_size = len(data)
+
+            elapsed_ms: float = (time.monotonic() - t0) * 1000
+            logger.info(
+                "<<< %dms HTTP %d [chat-passthrough] (%s -> %s)",
+                elapsed_ms, resp.status,
+                _fmt_size(req_size), _fmt_size(resp_size),
+            )
+            log_jsonl({
+                "ts": time.time(),
+                "path": self.path,
+                "request": {
+                    "model": model,
+                    "stream": is_stream,
+                    "n_messages": n_messages,
+                    "passthrough": "chat",
+                },
+                "response": {
+                    "status": resp.status,
+                    "stream": is_stream,
+                    "req_bytes": req_size,
+                    "resp_bytes": resp_size,
+                },
+                "elapsed_ms": round(elapsed_ms),
+            })
+        finally:
+            conn.close()
+
+    def _handle_responses_passthrough(self) -> None:
+        """Forward OpenAI-style /v1/responses requests to Copilot unchanged.
+
+        Cursor and other OpenAI-compatible clients use the Responses API
+        (`input` field instead of `messages`) for GPT-5.x and reasoning
+        models. Auth header is swapped for the Copilot OAuth token; body
+        and response are forwarded as-is.
+        """
+        t0: float = time.monotonic()
+        try:
+            content_length: int = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(400, "Invalid Content-Length")
+            return
+        if content_length > MAX_BODY_SIZE:
+            self.send_error(413, "Request body too large")
+            return
+        raw_body: bytes = self.rfile.read(content_length)
+        req_size: int = len(raw_body)
+
+        model: str = ""
+        is_stream: bool = False
+        n_input: int = 0
+        try:
+            peek: JsonDict = json.loads(raw_body) if raw_body else {}
+            if isinstance(peek, dict):
+                model = str(peek.get("model", ""))
+                is_stream = bool(peek.get("stream", False))
+                inp = peek.get("input")
+                if isinstance(inp, list):
+                    n_input = len(inp)
+                elif isinstance(inp, str):
+                    n_input = 1
+        except json.JSONDecodeError:
+            pass
+
+        logger.info(
+            ">>> %s model=%s stream=%s input=%d (%s) [responses-passthrough]",
+            self.path, model or "?", is_stream, n_input, _fmt_size(req_size),
+        )
+        self._forward_responses_passthrough(t0, raw_body, model, is_stream)
+
+    def _forward_responses_passthrough(
+        self, t0: float, raw_body: bytes, model: str, is_stream: bool,
+        translate_to_chat: bool = False,
+    ) -> None:
+        """Forward a Responses-API request body to Copilot's /responses endpoint.
+
+        When `translate_to_chat` is True, the upstream SSE stream is translated
+        into Chat-Completions SSE chunks on the fly (used when Cursor sends a
+        Responses-API body to /v1/chat/completions and expects a chat-completion
+        response in return).
+        """
+        if copilot_token_manager is None:
+            self.send_error(503, "/responses passthrough requires --copilot-auth")
+            logger.error("/responses hit but copilot_token_manager not initialized")
+            return
+        req_size: int = len(raw_body)
+
+        def _build_headers(token: str) -> dict[str, str]:
+            return {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Content-Length": str(req_size),
+                "Editor-Version": "vscode/1.96.0",
+                "Editor-Plugin-Version": "copilot/1.200.0",
+                "User-Agent": "GithubCopilot/1.200.0",
+                "Copilot-Integration-Id": "vscode-chat",
+                "Accept": "text/event-stream" if is_stream else "application/json",
+            }
+
+        current_token: str = copilot_token_manager.get_token()
+        conn = http.client.HTTPSConnection(COPILOT_HOST, context=SSL_CTX)
+        try:
+            conn.request(
+                "POST", "/responses",
+                body=raw_body, headers=_build_headers(current_token),
+            )
+            resp: http.client.HTTPResponse = conn.getresponse()
+
+            if resp.status in (401, 403):
+                logger.warning("Got %d on /responses, refreshing token", resp.status)
+                resp.read()
+                conn.close()
+                new_token: str = copilot_token_manager.invalidate()
+                conn = http.client.HTTPSConnection(COPILOT_HOST, context=SSL_CTX)
+                conn.request(
+                    "POST", "/responses",
+                    body=raw_body, headers=_build_headers(new_token),
+                )
+                resp = conn.getresponse()
+
+            content_type: str = resp.getheader("Content-Type") or "application/json"
+            is_event_stream: bool = "event-stream" in content_type
+            do_translate: bool = (
+                translate_to_chat and is_event_stream and resp.status == 200
+            )
+
+            self.send_response(resp.status)
+            if do_translate:
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                resp_size: int = _stream_responses_to_chat_completions(
+                    resp, self.wfile, model,
+                )
+            elif is_event_stream:
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                resp_size = 0
+                while True:
+                    chunk: bytes = resp.read(4096)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    resp_size += len(chunk)
+                    if b"\n" in chunk:
+                        self.wfile.flush()
+            else:
+                self.send_header("Content-Type", content_type)
+                data: bytes = resp.read()
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                resp_size = len(data)
+
+            elapsed_ms: float = (time.monotonic() - t0) * 1000
+            mode: str = "responses->chat" if do_translate else "responses-passthrough"
+            logger.info(
+                "<<< %dms HTTP %d [%s] (%s -> %s)",
+                elapsed_ms, resp.status, mode,
+                _fmt_size(req_size), _fmt_size(resp_size),
+            )
+            log_jsonl({
+                "ts": time.time(),
+                "path": self.path,
+                "request": {
+                    "model": model,
+                    "stream": is_stream,
+                    "passthrough": "responses",
+                    "translated": do_translate,
+                },
+                "response": {
+                    "status": resp.status,
+                    "stream": is_stream,
+                    "req_bytes": req_size,
+                    "resp_bytes": resp_size,
+                },
+                "elapsed_ms": round(elapsed_ms),
+            })
+        finally:
+            conn.close()
 
     def _handle_tavily_path(
         self, t0: float, raw_body: bytes, parsed_body: JsonDict,
@@ -1971,8 +2504,50 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"status":"ok"}')
-        else:
-            self.send_error(404)
+            return
+        if self.path in ("/models", "/v1/models"):
+            self._handle_models_passthrough()
+            return
+        self.send_error(404)
+
+    def _handle_models_passthrough(self) -> None:
+        """Forward GET /models (and /v1/models) to Copilot for Cursor probes."""
+        if not self._check_api_key():
+            return
+        if copilot_token_manager is None:
+            self.send_error(503, "/models passthrough requires --copilot-auth")
+            return
+        token: str = copilot_token_manager.get_token()
+        headers: dict[str, str] = {
+            "Authorization": f"Bearer {token}",
+            "Editor-Version": "vscode/1.96.0",
+            "Editor-Plugin-Version": "copilot/1.200.0",
+            "User-Agent": "GithubCopilot/1.200.0",
+            "Copilot-Integration-Id": "vscode-chat",
+        }
+        conn = http.client.HTTPSConnection(COPILOT_HOST, context=SSL_CTX)
+        try:
+            conn.request("GET", "/models", headers=headers)
+            resp: http.client.HTTPResponse = conn.getresponse()
+            if resp.status in (401, 403):
+                resp.read()
+                conn.close()
+                new_token: str = copilot_token_manager.invalidate()
+                headers["Authorization"] = f"Bearer {new_token}"
+                conn = http.client.HTTPSConnection(COPILOT_HOST, context=SSL_CTX)
+                conn.request("GET", "/models", headers=headers)
+                resp = conn.getresponse()
+            data: bytes = resp.read()
+            self.send_response(resp.status)
+            self.send_header(
+                "Content-Type", resp.getheader("Content-Type") or "application/json",
+            )
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            logger.info("<<< GET /models HTTP %d (%s)", resp.status, _fmt_size(len(data)))
+        finally:
+            conn.close()
 
     def log_message(self, format: str, *args: object) -> None:
         # Route through our logger instead of BaseHTTPRequestHandler's default
@@ -2041,9 +2616,11 @@ if __name__ == "__main__":
         else:
             logger.info("  Upstream model: %s (EXPERIMENTAL: OpenAI translation)", _upstream_model)
     if _api_key:
-        logger.info("  API key: required (x-api-key)")
+        logger.info("  API key: required (x-api-key or Authorization: Bearer)")
     else:
         logger.info("  API key: not configured (open access)")
+    if copilot_token_manager is not None:
+        logger.info("  OpenAI /chat/completions passthrough: ENABLED (Copilot upstream)")
     if _no_opus:
         logger.info("  Opus downgrade: ENABLED (claude-opus-* -> %s)", _no_opus_target)
     if _tavily_api_key:

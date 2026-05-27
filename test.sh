@@ -201,6 +201,47 @@ wait $MOCK_PID $PROXY_PID 2>/dev/null || true
 trap - EXIT
 rm -rf "$TMPDIR_LOCAL"
 
+# Routing test: /chat/completions and /v1/models should be registered routes.
+# Without --copilot-auth they return 503 (not 404), proving the dispatcher
+# matched them instead of falling through to the 404 branch.
+echo ""
+echo "=== /chat/completions + /v1/models routing ==="
+ROUTE_PORT=14836
+TMPDIR_ROUTE=$(mktemp -d)
+trap 'kill $ROUTE_PID 2>/dev/null || true; wait $ROUTE_PID 2>/dev/null || true; rm -rf "$TMPDIR_ROUTE"' EXIT
+
+PROXY_LOG_DIR="$TMPDIR_ROUTE/logs" python3 "$PROXY_PY" \
+    --port "$ROUTE_PORT" \
+    --upstream-base-url "http://127.0.0.1:1/v1" \
+    --upstream-model mock-model \
+    --log-level WARNING >"$TMPDIR_ROUTE/proxy.log" 2>&1 &
+ROUTE_PID=$!
+
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.5
+    curl -sf "http://localhost:$ROUTE_PORT/health" >/dev/null 2>&1 && break
+done
+
+CODE_POST=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}' \
+    "http://localhost:$ROUTE_PORT/chat/completions")
+CODE_GET=$(curl -s -o /dev/null -w "%{http_code}" \
+    "http://localhost:$ROUTE_PORT/v1/models")
+
+if [ "$CODE_POST" = "503" ] && [ "$CODE_GET" = "503" ]; then
+    green "PASS: /chat/completions and /v1/models routed (503 without --copilot-auth)"
+    PASS=$((PASS+1))
+else
+    red "FAIL: routing — POST /chat/completions=$CODE_POST GET /v1/models=$CODE_GET (expected 503/503)"
+    FAIL=$((FAIL+1))
+fi
+
+kill $ROUTE_PID 2>/dev/null || true
+wait $ROUTE_PID 2>/dev/null || true
+trap - EXIT
+rm -rf "$TMPDIR_ROUTE"
+
 echo ""
 echo "=============================="
 if [ "$FAIL" -eq 0 ]; then

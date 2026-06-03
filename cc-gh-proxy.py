@@ -19,6 +19,7 @@ import ipaddress
 import json
 import logging
 import os
+import queue
 import re
 import ssl
 import subprocess
@@ -26,10 +27,16 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any
+
+try:
+    import duckdb  # optional; telemetry disables itself if unavailable
+except ImportError:  # pragma: no cover - exercised only when dep missing
+    duckdb = None  # type: ignore[assignment]
 
 COPILOT_HOST: str = "api.githubcopilot.com"
 TAVILY_HOST: str = "api.tavily.com"
@@ -60,6 +67,9 @@ _upstream_base_url: str | None = None  # OpenAI-compatible upstream URL (bypasse
 _upstream_api_key: str | None = None  # Bearer token for --upstream-base-url
 _no_opus: bool = False  # Map any claude-opus-* request to a sonnet model
 _no_opus_target: str = "claude-sonnet-4.6"  # Target sonnet model when --no-opus is set
+
+# Telemetry (DuckDB) — set in main(). When _telemetry is None, telemetry is off.
+_telemetry: TelemetryWriter | None = None
 
 # Tavily configuration. When set, Claude Code's "WebSearch executor" requests
 # (the small follow-up call CC fires with tools=[web_search_*]) are served by
@@ -180,17 +190,85 @@ def parse_args() -> argparse.Namespace:
              "(env: PROXY_NO_OPUS_TARGET, default: claude-sonnet-4.6). "
              "Copilot currently only ships Sonnet 4.6 and 4.5, not 4.7",
     )
+    p.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        default=os.environ.get("PROXY_VERBOSE", "").lower() in ("1", "true", "yes"),
+        help="mirror the full request-by-request log to the console. By "
+             "default only the startup banner and warnings/errors are printed "
+             "(env: PROXY_VERBOSE, default: off)",
+    )
+    p.add_argument(
+        "--duckdb-path",
+        default=os.environ.get("PROXY_DUCKDB_PATH"),
+        help="path to a DuckDB file for per-request telemetry. Defaults to "
+             "<log-dir>/usage.duckdb. Requires the `duckdb` pip package; if it "
+             "is not installed, telemetry is disabled (env: PROXY_DUCKDB_PATH)",
+    )
+    p.add_argument(
+        "--no-duckdb",
+        action="store_true",
+        default=os.environ.get("PROXY_NO_DUCKDB", "").lower() in ("1", "true", "yes"),
+        help="disable DuckDB telemetry entirely (env: PROXY_NO_DUCKDB)",
+    )
+    p.add_argument(
+        "--duckdb-flush-interval",
+        type=float,
+        default=float(os.environ.get("PROXY_DUCKDB_FLUSH_INTERVAL", "2.0")),
+        help="seconds between DuckDB flushes. The writer opens/appends/closes "
+             "the file each flush so duckdb.exe can query it between flushes "
+             "(env: PROXY_DUCKDB_FLUSH_INTERVAL, default: 2.0)",
+    )
     return p.parse_args()
 
 
-def setup_logging(log_dir: Path, level: str) -> None:
+class _ConsoleFilter(logging.Filter):
+    """Decide which records reach the console.
+
+    Default: only warnings/errors and explicitly tagged banner records
+    (the startup summary). The per-request INFO stream stays out of the shell
+    (it is still written to proxy.log). With --verbose, everything passes.
+    """
+
+    def __init__(self, verbose: bool) -> None:
+        super().__init__()
+        self._verbose = verbose
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._verbose:
+            return True
+        return record.levelno >= logging.WARNING or getattr(record, "banner", False)
+
+
+class _LowerLevelFormatter(logging.Formatter):
+    """Render the level name lowercased, e.g. [info] / [warning] / [error]."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        original = record.levelname
+        record.levelname = original.lower()
+        try:
+            return super().format(record)
+        finally:
+            record.levelname = original
+
+
+def banner(msg: str, *args: object) -> None:
+    """Log an INFO line that is always shown on the console (startup summary)."""
+    logger.info(msg, *args, extra={"banner": True})
+
+
+def setup_logging(log_dir: Path, level: str, verbose: bool = False) -> None:
     """Configure console and file logging."""
     log_dir.mkdir(parents=True, exist_ok=True)
     log_dir.chmod(0o700)
     logger.setLevel(getattr(logging, level, logging.INFO))
 
+    # Console shows the startup banner + warnings/errors so the shell stays
+    # clean; the full request-by-request log (INFO) goes to proxy.log only.
+    # --verbose mirrors the entire INFO stream to the console too.
     console = logging.StreamHandler(sys.stderr)
-    console.setFormatter(logging.Formatter("[proxy] %(message)s"))
+    console.setFormatter(_LowerLevelFormatter("[%(levelname)s] %(message)s"))
+    console.addFilter(_ConsoleFilter(verbose))
     logger.addHandler(console)
 
     # Pre-create with restricted permissions before FileHandler opens it
@@ -376,7 +454,7 @@ class TokenManager:
             logger.error("%s", e)
             sys.exit(1)
         self._fetched_at: float = time.monotonic()
-        logger.info("Token acquired successfully")
+        logger.info("Token acquired successfully", extra={"banner": True})
 
     def get_token(self) -> str:
         """Return a valid token, refreshing if stale."""
@@ -670,10 +748,10 @@ ALLOWED_BODY_FIELDS: set[str] = {
 }
 
 
-def rewrite_body(raw_body: bytes) -> tuple[bytes, JsonDict]:
+def rewrite_body(raw_body: bytes) -> tuple[bytes, JsonDict, str]:
     """Rewrite model names and strip unsupported fields.
 
-    Returns (rewritten_body_bytes, parsed_body_dict).
+    Returns (rewritten_body_bytes, parsed_body_dict, original_model_name).
     """
     body: JsonDict = json.loads(raw_body)
     modified: bool = False
@@ -700,8 +778,8 @@ def rewrite_body(raw_body: bytes) -> tuple[bytes, JsonDict]:
         modified = True
 
     if modified:
-        return json.dumps(body).encode(), body
-    return raw_body, body
+        return json.dumps(body).encode(), body, original
+    return raw_body, body, original
 
 
 # ---------------------------------------------------------------------------
@@ -1143,6 +1221,392 @@ def openai_stream_to_anthropic_events(raw: str, model: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Telemetry (DuckDB)
+# ---------------------------------------------------------------------------
+
+# Editable pricing table for the *counterfactual* cost columns. These are NOT
+# what Copilot bills — they are Anthropic public list prices (USD per 1M
+# tokens) applied locally so you can compare models. `premium` is the GitHub
+# Copilot premium-request multiplier (closer to your real cost driver).
+# Keyed by the upstream (dotted) model name. Add rows as new models ship.
+PRICING: dict[str, dict[str, float]] = {
+    "claude-opus-4.6":   {"in": 15.0, "out": 75.0, "cache_read": 1.50, "cache_write": 18.75, "premium": 10.0},
+    "claude-opus-4.8":   {"in": 15.0, "out": 75.0, "cache_read": 1.50, "cache_write": 18.75, "premium": 10.0},
+    "claude-sonnet-4.6": {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75,  "premium": 1.0},
+    "claude-sonnet-4.5": {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75,  "premium": 1.0},
+    "claude-haiku-4.5":  {"in": 1.0,  "out": 5.0,  "cache_read": 0.10, "cache_write": 1.25,  "premium": 0.33},
+}
+
+# Ordered column list — the single source of truth for both the DDL and the
+# parameterized INSERT (keeps them from drifting apart).
+TELEMETRY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("request_id", "TEXT PRIMARY KEY"),
+    ("ts", "TIMESTAMP"),
+    ("session_id", "TEXT"),
+    ("account_id", "TEXT"),
+    ("response_message_id", "TEXT"),
+    ("requested_model", "TEXT"),
+    ("upstream_model", "TEXT"),
+    ("downgraded", "BOOLEAN"),
+    ("downgrade_to", "TEXT"),
+    ("route", "TEXT"),
+    ("upstream_host", "TEXT"),
+    ("retry_count", "INTEGER"),
+    ("beta_requested", "TEXT"),
+    ("beta_stripped", "TEXT"),
+    ("n_messages", "INTEGER"),
+    ("system_bytes", "INTEGER"),
+    ("tool_count", "INTEGER"),
+    ("tool_names", "TEXT[]"),
+    ("max_tokens", "INTEGER"),
+    ("temperature", "DOUBLE"),
+    ("top_p", "DOUBLE"),
+    ("top_k", "INTEGER"),
+    ("thinking_enabled", "BOOLEAN"),
+    ("thinking_budget", "INTEGER"),
+    ("stream", "BOOLEAN"),
+    ("req_bytes", "INTEGER"),
+    ("input_tokens", "INTEGER"),
+    ("output_tokens", "INTEGER"),
+    ("cache_read_tokens", "INTEGER"),
+    ("cache_creation_tokens", "INTEGER"),
+    ("cache_creation_5m", "INTEGER"),
+    ("cache_creation_1h", "INTEGER"),
+    ("total_tokens", "INTEGER"),
+    ("cache_hit_ratio", "DOUBLE"),
+    ("web_search_requests", "INTEGER"),
+    ("status", "INTEGER"),
+    ("stop_reason", "TEXT"),
+    ("completed", "BOOLEAN"),
+    ("elapsed_ms", "INTEGER"),
+    ("ttft_ms", "INTEGER"),
+    ("output_tokens_per_sec", "DOUBLE"),
+    ("resp_bytes", "INTEGER"),
+    ("response_tool_names", "TEXT[]"),
+    ("error_type", "TEXT"),
+    ("error_message", "TEXT"),
+    ("est_anthropic_cost_usd", "DOUBLE"),
+    ("copilot_premium_multiplier", "DOUBLE"),
+    ("tavily_cost_usd", "DOUBLE"),
+)
+
+TELEMETRY_DDL: str = (
+    "CREATE TABLE IF NOT EXISTS requests (\n  "
+    + ",\n  ".join(f"{name} {decl}" for name, decl in TELEMETRY_COLUMNS)
+    + "\n)"
+)
+
+_USER_ID_RE: re.Pattern[str] = re.compile(
+    r"_account_(?P<account>.*?)_session_(?P<session>.+)$"
+)
+
+
+def parse_user_id(user_id: str | None) -> tuple[str | None, str | None]:
+    """Split Claude Code's metadata.user_id into (session_id, account_id).
+
+    Two formats are seen in the wild:
+      1. A JSON object string (current Claude Code), e.g.
+         {"device_id": "...", "account_uuid": "", "session_id": "<uuid>"}
+      2. The legacy underscore string:
+         user_<hash>_account_<account-uuid>_session_<session-uuid>
+
+    For the JSON form, account_id prefers account_uuid but falls back to
+    device_id (account_uuid is often empty under Copilot auth) so there is a
+    stable per-install identifier to group by. Returns (None, None) when the
+    field is missing or unparseable.
+    """
+    if not user_id or not isinstance(user_id, str):
+        return None, None
+    s = user_id.strip()
+    if s.startswith("{"):
+        try:
+            obj = json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            obj = None
+        if isinstance(obj, dict):
+            session = obj.get("session_id") or None
+            account = obj.get("account_uuid") or obj.get("device_id") or None
+            return session, account
+    m = _USER_ID_RE.search(s)
+    if not m:
+        return None, None
+    return m.group("session") or None, m.group("account") or None
+
+
+def build_request_tel(
+    parsed_body: JsonDict,
+    *,
+    request_id: str,
+    route: str,
+    requested_model: str,
+    upstream_model: str,
+    beta_requested: str | None,
+) -> dict[str, Any]:
+    """Build the request-time portion of a telemetry row.
+
+    Response-time fields (tokens, status, timing, ...) are filled in later by
+    the handler before the row is enqueued.
+    """
+    system = parsed_body.get("system")
+    tools: list[JsonDict] = parsed_body.get("tools") or []
+    tool_names = [t.get("name", "") for t in tools if isinstance(t, dict)]
+
+    thinking = parsed_body.get("thinking")
+    thinking_enabled = (
+        isinstance(thinking, dict) and thinking.get("type") == "enabled"
+    )
+    thinking_budget = (
+        thinking.get("budget_tokens") if isinstance(thinking, dict) else None
+    )
+
+    metadata = parsed_body.get("metadata")
+    user_id = metadata.get("user_id") if isinstance(metadata, dict) else None
+    session_id, account_id = parse_user_id(user_id)
+
+    downgraded = bool(_no_opus and requested_model.startswith("claude-opus-"))
+
+    return {
+        "request_id": request_id,
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "session_id": session_id,
+        "account_id": account_id,
+        "response_message_id": None,
+        "requested_model": requested_model,
+        "upstream_model": upstream_model,
+        "downgraded": downgraded,
+        "downgrade_to": _no_opus_target if downgraded else None,
+        "route": route,
+        "upstream_host": None,
+        "retry_count": 0,
+        "beta_requested": beta_requested,
+        "beta_stripped": None,
+        "n_messages": len(parsed_body.get("messages", [])),
+        "system_bytes": _content_size(system) if system else 0,
+        "tool_count": len(tools),
+        "tool_names": tool_names,
+        "max_tokens": parsed_body.get("max_tokens"),
+        "temperature": parsed_body.get("temperature"),
+        "top_p": parsed_body.get("top_p"),
+        "top_k": parsed_body.get("top_k"),
+        "thinking_enabled": thinking_enabled,
+        "thinking_budget": thinking_budget,
+        "stream": bool(parsed_body.get("stream", False)),
+        "req_bytes": None,
+        # response-time fields default to None/0 until filled in
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_creation_5m": 0,
+        "cache_creation_1h": 0,
+        "total_tokens": 0,
+        "cache_hit_ratio": None,
+        "web_search_requests": 0,
+        "status": None,
+        "stop_reason": None,
+        "completed": False,
+        "elapsed_ms": None,
+        "ttft_ms": None,
+        "output_tokens_per_sec": None,
+        "resp_bytes": None,
+        "response_tool_names": [],
+        "error_type": None,
+        "error_message": None,
+        "est_anthropic_cost_usd": 0.0,
+        "copilot_premium_multiplier": 0.0,
+        "tavily_cost_usd": 0.0,
+    }
+
+
+def finalize_usage_tel(
+    tel: dict[str, Any], usage: JsonDict, model: str,
+) -> None:
+    """Fold an Anthropic `usage` dict into a telemetry row (in place)."""
+    inp = usage.get("input_tokens", 0) or 0
+    out = usage.get("output_tokens", 0) or 0
+    cr = usage.get("cache_read_input_tokens", 0) or 0
+    cw = usage.get("cache_creation_input_tokens", 0) or 0
+    tel["input_tokens"] = inp
+    tel["output_tokens"] = out
+    tel["cache_read_tokens"] = cr
+    tel["cache_creation_tokens"] = cw
+
+    cache_creation = usage.get("cache_creation")
+    if isinstance(cache_creation, dict):
+        tel["cache_creation_5m"] = cache_creation.get("ephemeral_5m_input_tokens", 0) or 0
+        tel["cache_creation_1h"] = cache_creation.get("ephemeral_1h_input_tokens", 0) or 0
+
+    server_tool_use = usage.get("server_tool_use")
+    if isinstance(server_tool_use, dict):
+        tel["web_search_requests"] = server_tool_use.get("web_search_requests", 0) or 0
+
+    tel["total_tokens"] = inp + out + cr + cw
+    denom = inp + cr
+    tel["cache_hit_ratio"] = round(cr / denom, 4) if denom else None
+
+    cost, premium = _est_cost(model, usage)
+    tel["est_anthropic_cost_usd"] = cost
+    tel["copilot_premium_multiplier"] = premium
+
+
+def _est_cost(model: str, usage: dict[str, Any]) -> tuple[float, float]:
+    """Return (est_anthropic_cost_usd, copilot_premium_multiplier) for a usage dict.
+
+    Cost is a counterfactual list-price estimate, not real Copilot billing.
+    """
+    p = PRICING.get(model)
+    if not p:
+        return 0.0, 0.0
+    inp = usage.get("input_tokens", 0) or 0
+    out = usage.get("output_tokens", 0) or 0
+    cr = usage.get("cache_read_input_tokens", 0) or 0
+    cw = usage.get("cache_creation_input_tokens", 0) or 0
+    cost = (
+        inp * p["in"]
+        + out * p["out"]
+        + cr * p["cache_read"]
+        + cw * p["cache_write"]
+    ) / 1_000_000.0
+    return round(cost, 6), p.get("premium", 0.0)
+
+
+class TelemetryWriter:
+    """Background DuckDB writer.
+
+    A single thread owns all DB access via a queue. Request threads only
+    enqueue dict rows (never blocks the response). The writer batches rows and
+    flushes them by opening the DB, appending, and closing — so the file lock
+    is released between flushes and `duckdb.exe` can query the DB live.
+    """
+
+    # Cap on rows retained across failed flushes (e.g. while another process
+    # holds the DB lock). Beyond this we drop the oldest — they remain in
+    # requests.jsonl, the source of truth, so nothing is truly lost.
+    MAX_PENDING: int = 10_000
+
+    def __init__(self, db_path: Path, flush_interval: float = 2.0,
+                 max_batch: int = 100) -> None:
+        self._db_path = db_path
+        self._flush_interval = max(0.25, flush_interval)
+        self._max_batch = max_batch
+        self._q: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._col_names: list[str] = [name for name, _ in TELEMETRY_COLUMNS]
+        self._lock_warned: bool = False
+        self._thread = threading.Thread(
+            target=self._run, name="telemetry-writer", daemon=True
+        )
+
+    def start(self) -> None:
+        # Validate we can open the DB and create the table up-front; if this
+        # fails, the caller disables telemetry rather than starting the thread.
+        con = duckdb.connect(str(self._db_path))
+        try:
+            con.execute(TELEMETRY_DDL)
+        finally:
+            con.close()
+        self._thread.start()
+
+    def enqueue(self, row: dict[str, Any]) -> None:
+        self._q.put(row)
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Signal shutdown and wait for the final flush."""
+        self._q.put(None)
+        self._thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        # `pending` carries rows that could not be flushed yet (e.g. the DB is
+        # locked by another process); they are retried on the next flush.
+        pending: list[dict[str, Any]] = []
+        stopping = False
+        while not stopping:
+            try:
+                item = self._q.get(timeout=self._flush_interval)
+                if item is None:
+                    stopping = True
+                else:
+                    pending.append(item)
+                    while len(pending) < self._max_batch:
+                        try:
+                            nxt = self._q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if nxt is None:
+                            stopping = True
+                            break
+                        pending.append(nxt)
+            except queue.Empty:
+                pass  # interval elapsed — flush whatever is pending
+
+            if pending and self._flush(pending):
+                pending = []
+            elif len(pending) > self.MAX_PENDING:
+                drop = len(pending) - self.MAX_PENDING
+                logger.warning(
+                    "Telemetry: %d rows still unflushed (DB locked?); dropping "
+                    "%d oldest. They remain in requests.jsonl.",
+                    len(pending), drop,
+                )
+                pending = pending[drop:]
+
+        # Final drain on shutdown — one best-effort attempt.
+        if pending:
+            if self._flush(pending):
+                logger.info("Telemetry: flushed %d pending rows on shutdown", len(pending))
+            else:
+                logger.warning(
+                    "Telemetry: %d rows could not be flushed on shutdown "
+                    "(DB locked?); they remain in requests.jsonl", len(pending),
+                )
+
+    def _flush(self, batch: list[dict[str, Any]]) -> bool:
+        """Append a batch to DuckDB. Returns True on success.
+
+        On failure (e.g. the DB file is locked by another process) the rows are
+        NOT consumed — the caller retains them and retries on the next flush.
+        """
+        try:
+            con = duckdb.connect(str(self._db_path))
+        except Exception as e:
+            if not self._lock_warned:
+                logger.warning(
+                    "Telemetry: cannot open %s (%s). Rows are buffered and will "
+                    "be written once the DB is free (e.g. close other clients "
+                    "like DataGrip).", self._db_path, e,
+                )
+                self._lock_warned = True
+            return False
+        self._lock_warned = False
+        try:
+            con.execute(TELEMETRY_DDL)
+            placeholders = ", ".join("?" for _ in self._col_names)
+            sql = (
+                f"INSERT OR IGNORE INTO requests ({', '.join(self._col_names)}) "
+                f"VALUES ({placeholders})"
+            )
+            rows = [[r.get(name) for name in self._col_names] for r in batch]
+            con.executemany(sql, rows)
+            return True
+        except Exception:
+            # A genuine insert error (not a lock) — drop to avoid a poison batch
+            # looping forever. Data is still in requests.jsonl.
+            logger.exception("Telemetry: insert failed; dropping %d rows", len(batch))
+            return True
+        finally:
+            con.close()
+
+
+def record_telemetry(row: dict[str, Any]) -> None:
+    """Enqueue a telemetry row if telemetry is enabled. Never raises."""
+    if _telemetry is None:
+        return
+    try:
+        _telemetry.enqueue(row)
+    except Exception:
+        logger.debug("Telemetry enqueue failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -1174,6 +1638,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return
 
         t0: float = time.monotonic()
+        request_id: str = uuid.uuid4().hex
+        beta_requested: str | None = self.headers.get("anthropic-beta")
         try:
             content_length: int = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -1208,13 +1674,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
             for detail in summarize_messages(pre_parsed):
                 logger.info("    %s", detail)
-            self._handle_tavily_path(t0, raw_body, pre_parsed)
+            tavily_model: str = pre_parsed.get("model", "")
+            tel = build_request_tel(
+                pre_parsed,
+                request_id=request_id,
+                route="tavily",
+                requested_model=tavily_model,
+                upstream_model=tavily_model,
+                beta_requested=beta_requested,
+            )
+            self._handle_tavily_path(t0, raw_body, pre_parsed, tel)
             return
 
         # Rewrite model name and strip unsupported fields
         body_to_send: bytes
         parsed_body: JsonDict
-        body_to_send, parsed_body = rewrite_body(raw_body)
+        original_model: str
+        body_to_send, parsed_body, original_model = rewrite_body(raw_body)
 
         # Determine the effective upstream model and routing
         effective_model: str = _upstream_model or parsed_body.get("model", "")
@@ -1237,13 +1713,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
         for detail in summarize_messages(parsed_body):
             logger.info("    %s", detail)
 
+        tel = build_request_tel(
+            parsed_body,
+            request_id=request_id,
+            route=route,
+            requested_model=original_model,
+            upstream_model=effective_model if use_openai else parsed_body.get("model", ""),
+            beta_requested=beta_requested,
+        )
+        tel["req_bytes"] = req_size
+        tel["upstream_host"] = _upstream_base_url or COPILOT_HOST
+
         if use_openai:
-            self._handle_openai_path(t0, parsed_body, effective_model)
+            self._handle_openai_path(t0, parsed_body, effective_model, tel)
         else:
-            self._handle_native_path(t0, body_to_send, parsed_body)
+            self._handle_native_path(t0, body_to_send, parsed_body, tel)
 
     def _handle_tavily_path(
         self, t0: float, raw_body: bytes, parsed_body: JsonDict,
+        tel: dict[str, Any],
     ) -> None:
         """Serve a CC WebSearch executor request from Tavily.
 
@@ -1256,11 +1744,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """
         assert _tavily_api_key is not None
         req_size: int = len(raw_body)
+        tel["req_bytes"] = req_size
+        tel["upstream_host"] = TAVILY_HOST
 
         query: str = _extract_search_query(parsed_body)
         if not query:
             self.send_error(400, "Could not extract search query from request")
             logger.warning("Refused [tavily]: empty search query")
+            tel["status"] = 400
+            tel["error_type"] = "empty_search_query"
+            tel["elapsed_ms"] = round((time.monotonic() - t0) * 1000)
+            record_telemetry(tel)
             return
 
         try:
@@ -1269,6 +1763,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             logger.exception("Tavily call failed")
             err_msg = f"Tavily error: {e}"
             self.send_error(502, err_msg)
+            tel["status"] = 502
+            tel["error_type"] = "tavily_error"
+            tel["error_message"] = str(e)[:500]
+            tel["elapsed_ms"] = round((time.monotonic() - t0) * 1000)
+            record_telemetry(tel)
             return
 
         cost: float = TAVILY_PRICING.get(_tavily_search_depth, 0.01)
@@ -1359,6 +1858,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             },
             "elapsed_ms": round(elapsed_ms),
         })
+
+        finalize_usage_tel(tel, usage, model)
+        tel["response_message_id"] = msg_id
+        tel["status"] = 200
+        tel["stop_reason"] = "end_turn"
+        tel["completed"] = True
+        tel["resp_bytes"] = resp_size
+        tel["elapsed_ms"] = round(elapsed_ms)
+        tel["tavily_cost_usd"] = round(cost, 4)
+        record_telemetry(tel)
 
     @staticmethod
     def _tavily_to_anthropic_sse(
@@ -1459,6 +1968,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_native_path(
         self, t0: float, body_to_send: bytes, parsed_body: JsonDict,
+        tel: dict[str, Any],
     ) -> None:
         """Forward request to Copilot's native Anthropic /v1/messages endpoint."""
         req_size: int = len(body_to_send)
@@ -1477,10 +1987,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Forward anthropic-beta but strip features Copilot doesn't support
         raw_beta: str | None = self.headers.get("anthropic-beta")
         if raw_beta:
+            betas = [b.strip() for b in raw_beta.split(",")]
             supported = [
-                b.strip() for b in raw_beta.split(",")
-                if not b.strip().startswith(_STRIP_BETA_PREFIXES)
+                b for b in betas if not b.startswith(_STRIP_BETA_PREFIXES)
             ]
+            stripped = [b for b in betas if b.startswith(_STRIP_BETA_PREFIXES)]
+            if stripped:
+                tel["beta_stripped"] = ", ".join(stripped)
             if supported:
                 upstream_headers["anthropic-beta"] = ", ".join(supported)
 
@@ -1496,6 +2009,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 logger.warning("Got 401, refreshing token and retrying")
                 resp.read()
                 conn.close()
+                tel["retry_count"] = tel.get("retry_count", 0) + 1
                 new_token: str = token_manager.invalidate()
                 upstream_headers["Authorization"] = f"Bearer {new_token}"
                 conn = http.client.HTTPSConnection(COPILOT_HOST, context=SSL_CTX)
@@ -1521,20 +2035,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     self.send_header("Content-Length", resp_length)
             self.end_headers()
 
-            self._forward_and_log(resp, is_stream, t0, req_size, parsed_body)
+            self._forward_and_log(resp, is_stream, t0, req_size, parsed_body, tel)
         finally:
             conn.close()
 
     def _handle_openai_path(
         self, t0: float, parsed_body: JsonDict, model: str,
+        tel: dict[str, Any],
     ) -> None:
         """Translate to OpenAI format, send to /chat/completions, translate back."""
         if _upstream_base_url:
-            self._handle_local_openai_path(t0, parsed_body, model)
+            self._handle_local_openai_path(t0, parsed_body, model, tel)
             return
         if copilot_token_manager is None:
             self.send_error(503, "Non-Claude models require --copilot-auth")
             logger.error("OpenAI path requested but copilot_token_manager not initialized")
+            tel["status"] = 503
+            tel["error_type"] = "no_copilot_auth"
+            tel["elapsed_ms"] = round((time.monotonic() - t0) * 1000)
+            record_telemetry(tel)
             return
 
         is_stream: bool = parsed_body.get("stream", False)
@@ -1565,6 +2084,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 logger.warning("Got %d, refreshing Copilot token and retrying", resp.status)
                 resp.read()
                 conn.close()
+                tel["retry_count"] = tel.get("retry_count", 0) + 1
                 new_token: str = copilot_token_manager.invalidate()
                 upstream_headers["Authorization"] = f"Bearer {new_token}"
                 conn = http.client.HTTPSConnection(COPILOT_HOST, context=SSL_CTX)
@@ -1585,6 +2105,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 logger.info("<<< %dms HTTP %d (%s -> %s)",
                             elapsed_ms, resp.status,
                             _fmt_size(req_size), _fmt_size(len(resp_data)))
+                tel["status"] = resp.status
+                tel["error_type"] = f"http_{resp.status}"
+                tel["error_message"] = resp_data.decode(errors="replace")[:500]
+                tel["req_bytes"] = req_size
+                tel["resp_bytes"] = len(resp_data)
+                tel["elapsed_ms"] = round(elapsed_ms)
+                record_telemetry(tel)
                 return
 
             if is_stream:
@@ -1633,6 +2160,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "response": stream_resp_log,
                     "elapsed_ms": round(elapsed_ms),
                 })
+                self._record_openai_stream_tel(
+                    tel, anthropic_stream, model, 200, req_size, resp_size, elapsed_ms,
+                )
             else:
                 resp_data = resp.read()
                 oai_resp: JsonDict = json.loads(resp_data)
@@ -1672,11 +2202,52 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "response": nonstream_resp_log,
                     "elapsed_ms": round(elapsed_ms),
                 })
+                self._record_openai_nonstream_tel(
+                    tel, anthropic_resp, model, 200, req_size, resp_size, elapsed_ms,
+                )
         finally:
             conn.close()
 
+    def _record_openai_stream_tel(
+        self, tel: dict[str, Any], anthropic_stream: str, model: str,
+        status: int, req_size: int, resp_size: int, elapsed_ms: float,
+    ) -> None:
+        """Capture telemetry for a translated OpenAI streaming response.
+
+        Note: the OpenAI usage shape has no cache fields, so cache_* stay 0.
+        """
+        finalize_usage_tel(tel, self._extract_stream_usage(anthropic_stream), model)
+        tel["status"] = status
+        tel["stop_reason"] = self._extract_stream_stop_reason(anthropic_stream)
+        tel["completed"] = '"type": "message_stop"' in anthropic_stream
+        tel["response_message_id"] = self._extract_stream_message_id(anthropic_stream)
+        tel["response_tool_names"] = self._extract_stream_tool_names(anthropic_stream)
+        tel["resp_bytes"] = resp_size
+        tel["elapsed_ms"] = round(elapsed_ms)
+        record_telemetry(tel)
+
+    def _record_openai_nonstream_tel(
+        self, tel: dict[str, Any], anthropic_resp: JsonDict, model: str,
+        status: int, req_size: int, resp_size: int, elapsed_ms: float,
+    ) -> None:
+        """Capture telemetry for a translated OpenAI non-streaming response."""
+        finalize_usage_tel(tel, anthropic_resp.get("usage", {}), model)
+        tel["status"] = status
+        tel["stop_reason"] = anthropic_resp.get("stop_reason")
+        tel["completed"] = True
+        tel["response_message_id"] = anthropic_resp.get("id")
+        tel["response_tool_names"] = [
+            b.get("name", "")
+            for b in anthropic_resp.get("content", [])
+            if isinstance(b, dict) and b.get("type") == "tool_use"
+        ]
+        tel["resp_bytes"] = resp_size
+        tel["elapsed_ms"] = round(elapsed_ms)
+        record_telemetry(tel)
+
     def _handle_local_openai_path(
         self, t0: float, parsed_body: JsonDict, model: str,
+        tel: dict[str, Any],
     ) -> None:
         """Translate Anthropic -> OpenAI and forward to a local OpenAI-compatible endpoint."""
         assert _upstream_base_url is not None
@@ -1722,6 +2293,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 logger.info("<<< %dms HTTP %d (%s -> %s)",
                             elapsed_ms, resp.status,
                             _fmt_size(req_size), _fmt_size(len(resp_data)))
+                tel["status"] = resp.status
+                tel["error_type"] = f"http_{resp.status}"
+                tel["error_message"] = resp_data.decode(errors="replace")[:500]
+                tel["req_bytes"] = req_size
+                tel["resp_bytes"] = len(resp_data)
+                tel["elapsed_ms"] = round(elapsed_ms)
+                record_telemetry(tel)
                 return
 
             if is_stream:
@@ -1770,6 +2348,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "response": stream_resp_log,
                     "elapsed_ms": round(elapsed_ms),
                 })
+                self._record_openai_stream_tel(
+                    tel, anthropic_stream, model, 200, req_size, resp_size, elapsed_ms,
+                )
             else:
                 resp_data = resp.read()
                 oai_resp: JsonDict = json.loads(resp_data)
@@ -1810,20 +2391,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "response": nonstream_resp_log,
                     "elapsed_ms": round(elapsed_ms),
                 })
+                self._record_openai_nonstream_tel(
+                    tel, anthropic_resp, model, 200, req_size, resp_size, elapsed_ms,
+                )
         finally:
             conn.close()
     def _forward_and_log(
         self, resp: http.client.HTTPResponse, is_stream: bool,
         t0: float, req_size: int, parsed_body: JsonDict,
+        tel: dict[str, Any],
     ) -> None:
         """Forward upstream response to client and log it."""
         elapsed_ms: float
+        model: str = tel.get("upstream_model") or parsed_body.get("model", "")
         if is_stream:
             collected: bytearray = bytearray()
+            ttft_ms: int | None = None
             while True:
                 chunk: bytes = resp.read(4096)
                 if not chunk:
                     break
+                if ttft_ms is None and b"text_delta" in chunk:
+                    ttft_ms = round((time.monotonic() - t0) * 1000)
                 self.wfile.write(chunk)
                 collected.extend(chunk)
                 if b"\n" in chunk:
@@ -1856,6 +2445,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "response": stream_resp_log,
                 "elapsed_ms": round(elapsed_ms),
             })
+
+            finalize_usage_tel(tel, stream_usage, model)
+            tel["status"] = resp.status
+            tel["stop_reason"] = self._extract_stream_stop_reason(decoded_stream)
+            tel["completed"] = "event: message_stop" in decoded_stream or (
+                '"type": "message_stop"' in decoded_stream
+            )
+            tel["resp_bytes"] = resp_size
+            tel["elapsed_ms"] = round(elapsed_ms)
+            tel["ttft_ms"] = ttft_ms
+            tel["response_message_id"] = self._extract_stream_message_id(decoded_stream)
+            tel["response_tool_names"] = self._extract_stream_tool_names(decoded_stream)
+            gen_s = (elapsed_ms - (ttft_ms or 0)) / 1000.0
+            if gen_s > 0 and tel["output_tokens"]:
+                tel["output_tokens_per_sec"] = round(tel["output_tokens"] / gen_s, 2)
+            if resp.status != 200:
+                tel["error_type"] = f"http_{resp.status}"
+            record_telemetry(tel)
         else:
             resp_data: bytes = resp.read()
             resp_size = len(resp_data)
@@ -1892,6 +2499,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "response": nonstream_resp_log,
                 "elapsed_ms": round(elapsed_ms),
             })
+
+            tel["status"] = resp.status
+            tel["resp_bytes"] = resp_size
+            tel["elapsed_ms"] = round(elapsed_ms)
+            if resp_body and resp.status == 200:
+                finalize_usage_tel(tel, resp_body.get("usage", {}), model)
+                tel["stop_reason"] = resp_body.get("stop_reason")
+                tel["completed"] = True
+                tel["response_message_id"] = resp_body.get("id")
+                tel["response_tool_names"] = [
+                    b.get("name", "")
+                    for b in resp_body.get("content", [])
+                    if isinstance(b, dict) and b.get("type") == "tool_use"
+                ]
+            else:
+                tel["error_type"] = f"http_{resp.status}"
+                if resp_body:
+                    tel["error_message"] = json.dumps(
+                        resp_body.get("error", {}))[:500]
+            record_telemetry(tel)
 
     @staticmethod
     def _request_log_entry(body: JsonDict) -> JsonDict:
@@ -1965,6 +2592,45 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     usage.update(delta_usage)
         return usage
 
+    @staticmethod
+    def _iter_stream_events(raw: str) -> "list[JsonDict]":
+        """Parse all JSON events out of an Anthropic SSE stream."""
+        events: list[JsonDict] = []
+        for line in raw.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            try:
+                events.append(json.loads(line[6:]))
+            except json.JSONDecodeError:
+                continue
+        return events
+
+    @classmethod
+    def _extract_stream_stop_reason(cls, raw: str) -> str | None:
+        for event in cls._iter_stream_events(raw):
+            if event.get("type") == "message_delta":
+                stop = event.get("delta", {}).get("stop_reason")
+                if stop:
+                    return stop
+        return None
+
+    @classmethod
+    def _extract_stream_message_id(cls, raw: str) -> str | None:
+        for event in cls._iter_stream_events(raw):
+            if event.get("type") == "message_start":
+                return event.get("message", {}).get("id")
+        return None
+
+    @classmethod
+    def _extract_stream_tool_names(cls, raw: str) -> list[str]:
+        names: list[str] = []
+        for event in cls._iter_stream_events(raw):
+            if event.get("type") == "content_block_start":
+                block = event.get("content_block", {})
+                if block.get("type") == "tool_use":
+                    names.append(block.get("name", ""))
+        return names
+
     def do_GET(self) -> None:
         if self.path == "/health":
             self.send_response(200)
@@ -2003,7 +2669,25 @@ if __name__ == "__main__":
     _tavily_search_depth = args.tavily_search_depth
     _tavily_max_results = args.tavily_max_results
 
-    setup_logging(_log_dir, args.log_level)
+    setup_logging(_log_dir, args.log_level, verbose=args.verbose)
+
+    # DuckDB telemetry — optional, disables itself gracefully if the duckdb
+    # package is missing or the DB can't be opened.
+    if not args.no_duckdb:
+        if duckdb is None:
+            logger.warning(
+                "Telemetry: --duckdb requested but the `duckdb` package is not "
+                "installed. Run `pip install duckdb` to enable. Disabling telemetry."
+            )
+        else:
+            db_path = Path(args.duckdb_path) if args.duckdb_path else _log_dir / "usage.duckdb"
+            try:
+                writer = TelemetryWriter(db_path, flush_interval=args.duckdb_flush_interval)
+                writer.start()
+                _telemetry = writer
+            except Exception:
+                logger.exception("Telemetry: failed to initialize DuckDB at %s; disabling", db_path)
+                _telemetry = None
 
     # In local-upstream mode we bypass both Copilot paths entirely.
     token_manager: TokenManager | None = None
@@ -2026,36 +2710,45 @@ if __name__ == "__main__":
                 logger.error("Copilot auth failed: %s", e)
                 sys.exit(1)
 
-    logger.info("cc-gh-proxy starting on http://%s:%d", args.host, args.port)
+    banner("cc-gh-proxy starting on http://%s:%d", args.host, args.port)
     if _upstream_base_url:
-        logger.info("  Upstream: %s (local OpenAI-compatible)", _upstream_base_url)
+        banner("  Upstream: %s (local OpenAI-compatible)", _upstream_base_url)
         if _upstream_api_key:
-            logger.info("  Upstream API key: configured")
+            banner("  Upstream API key: configured")
     else:
-        logger.info("  Upstream: %s", COPILOT_HOST)
+        banner("  Upstream: %s", COPILOT_HOST)
     if _upstream_model:
         if _upstream_base_url:
-            logger.info("  Upstream model: %s (local)", _upstream_model)
+            banner("  Upstream model: %s (local)", _upstream_model)
         elif _is_claude_model(_upstream_model):
-            logger.info("  Upstream model: %s (native Anthropic pass-through)", _upstream_model)
+            banner("  Upstream model: %s (native Anthropic pass-through)", _upstream_model)
         else:
-            logger.info("  Upstream model: %s (EXPERIMENTAL: OpenAI translation)", _upstream_model)
+            banner("  Upstream model: %s (EXPERIMENTAL: OpenAI translation)", _upstream_model)
     if _api_key:
-        logger.info("  API key: required (x-api-key)")
+        banner("  API key: required (x-api-key)")
     else:
-        logger.info("  API key: not configured (open access)")
+        banner("  API key: not configured (open access)")
     if _no_opus:
-        logger.info("  Opus downgrade: ENABLED (claude-opus-* -> %s)", _no_opus_target)
+        banner("  Opus downgrade: ENABLED (claude-opus-* -> %s)", _no_opus_target)
     if _tavily_api_key:
-        logger.info(
+        banner(
             "  Tavily search: ENABLED -> %s (depth=%s, max_results=%d)",
             TAVILY_HOST, _tavily_search_depth, _tavily_max_results,
         )
     if token_manager is not None:
-        logger.info("  Token auto-refresh: every %ds", TokenManager.REFRESH_INTERVAL)
-    logger.info("  Logs: %s", _log_dir)
+        banner("  Token auto-refresh: every %ds", TokenManager.REFRESH_INTERVAL)
+    if _telemetry is not None:
+        banner(
+            "  Telemetry: ENABLED -> %s (flush every %.1fs)",
+            _telemetry._db_path, args.duckdb_flush_interval,
+        )
+    elif not args.no_duckdb and duckdb is not None:
+        banner("  Telemetry: disabled (init failed)")
+    else:
+        banner("  Telemetry: disabled")
+    banner("  Logs: %s", _log_dir)
     if _log_requests:
-        logger.info("  Request logging: ENABLED (message content will be persisted)")
+        banner("  Request logging: ENABLED (message content will be persisted)")
 
     if not _is_loopback(args.host):
         logger.warning(
@@ -2070,3 +2763,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Stopping proxy.")
         server.server_close()
+    finally:
+        if _telemetry is not None:
+            logger.info("Flushing telemetry...")
+            _telemetry.stop()

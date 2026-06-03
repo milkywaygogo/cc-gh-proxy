@@ -1,0 +1,5 @@
+# Optional dependency for DuckDB telemetry (see README "Telemetry / DuckDB").
+# The proxy core is stdlib-only and runs without this; telemetry disables
+# itself gracefully when duckdb is not importable.
+#   pip install -r requirements-telemetry.txt
+duckdb>=1.0.0

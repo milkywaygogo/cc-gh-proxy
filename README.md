@@ -282,6 +282,9 @@ All options can be set via CLI arguments or environment variables. CLI takes pre
 | `--tavily-api-key`    | `PROXY_TAVILY_API_KEY`    | *(none)*              | Enable Tavily WebSearch interception (see below)           |
 | `--tavily-search-depth` | `PROXY_TAVILY_SEARCH_DEPTH` | `advanced`        | Tavily depth: `basic` ($0.005) or `advanced` ($0.008)      |
 | `--tavily-max-results` | `PROXY_TAVILY_MAX_RESULTS` | `5`                  | Maximum results per Tavily search                          |
+| `--duckdb-path`       | `PROXY_DUCKDB_PATH`       | `<log-dir>/usage.duckdb` | DuckDB file for per-request telemetry (see below)      |
+| `--no-duckdb`         | `PROXY_NO_DUCKDB`         | off                   | Disable DuckDB telemetry entirely                          |
+| `--duckdb-flush-interval` | `PROXY_DUCKDB_FLUSH_INTERVAL` | `2.0`           | Seconds between DuckDB flushes                             |
 
 ### API key authentication
 
@@ -301,6 +304,111 @@ The proxy writes three levels of logging:
 - **`logs/proxy.log`** — same as console but timestamped, for reviewing later
 - **`logs/requests.jsonl`** — machine-readable, one JSON object per request with
   full details (model, messages, usage, timing, response text)
+
+## Telemetry / DuckDB
+
+The proxy can record one row of structured telemetry per request into a DuckDB
+database, so you can query token usage, cache efficiency, latency, and a
+cost-equivalent estimate per conversation/session.
+
+### Setup
+
+Telemetry needs the optional `duckdb` Python package (the proxy core stays
+stdlib-only; if `duckdb` is not importable, telemetry disables itself and the
+proxy runs normally):
+
+```bash
+pip install -r requirements-telemetry.txt
+```
+
+It is **on by default** once `duckdb` is installed, writing to
+`logs/usage.duckdb`. Disable with `--no-duckdb`, or point elsewhere with
+`--duckdb-path /path/to/usage.duckdb`.
+
+### How writes work (and querying live)
+
+A single background thread owns all DB access via a queue — request threads
+only enqueue a row, so the response path is never blocked. The writer batches
+rows and **opens, appends, then closes** the file on each flush (every
+`--duckdb-flush-interval` seconds, default 2s). Because the file is unlocked
+between flushes, you can query it with `duckdb.exe` while the proxy runs:
+
+```bash
+duckdb logs/usage.duckdb "SELECT count(*), sum(output_tokens) FROM requests"
+```
+
+DuckDB allows only one read-write process at a time, so a query that lands
+exactly during a flush may briefly fail to acquire the lock — just retry.
+`logs/requests.jsonl` remains the append-only source of truth; the DuckDB file
+is a derived index you can always rebuild from the log.
+
+### Schema
+
+The `requests` table is created automatically. Key columns:
+
+- **identity**: `request_id`, `ts`, `session_id`, `account_id`, `response_message_id`
+- **model**: `requested_model`, `upstream_model`, `downgraded`, `downgrade_to`
+- **routing**: `route` (`native`/`openai`/`local`/`tavily`), `upstream_host`, `retry_count`, `beta_requested`, `beta_stripped`
+- **request shape**: `n_messages`, `system_bytes`, `tool_count`, `tool_names`, `max_tokens`, `temperature`, `top_p`, `top_k`, `thinking_enabled`, `thinking_budget`, `stream`, `req_bytes`
+- **tokens**: `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cache_creation_5m`, `cache_creation_1h`, `total_tokens`, `cache_hit_ratio`, `web_search_requests`
+- **outcome/perf**: `status`, `stop_reason`, `completed`, `elapsed_ms`, `ttft_ms`, `output_tokens_per_sec`, `resp_bytes`, `response_tool_names`, `error_type`, `error_message`
+- **cost (counterfactual)**: `est_anthropic_cost_usd`, `copilot_premium_multiplier`, `tavily_cost_usd`
+
+> Cost columns are **not** real Copilot billing — they apply Anthropic public
+> list prices to the token counts so you can compare models. Copilot bills by
+> premium requests, not per token. Edit the `PRICING` table near the top of
+> `cc-gh-proxy.py` to adjust rates. Cache columns are only populated on the
+> `native` Claude route; translated `openai`/`local`/`tavily` rows leave them 0.
+
+### Example queries
+
+Tokens and cost-equivalent per session (a conversation; note it may split
+across `/resume` if Claude Code starts a new session id):
+
+```sql
+SELECT session_id,
+       count(*)                       AS turns,
+       sum(input_tokens)              AS input,
+       sum(output_tokens)             AS output,
+       sum(cache_read_tokens)         AS cache_read,
+       round(sum(est_anthropic_cost_usd), 2) AS est_usd
+FROM requests
+GROUP BY session_id
+ORDER BY est_usd DESC;
+```
+
+Cache hit ratio over time (per day):
+
+```sql
+SELECT ts::DATE AS day,
+       round(sum(cache_read_tokens) * 1.0
+             / nullif(sum(input_tokens + cache_read_tokens), 0), 3) AS cache_hit_ratio
+FROM requests
+WHERE route = 'native'
+GROUP BY day ORDER BY day;
+```
+
+Token cost-equivalent by model:
+
+```sql
+SELECT upstream_model,
+       count(*) AS calls,
+       sum(total_tokens) AS tokens,
+       round(sum(est_anthropic_cost_usd), 2) AS est_usd
+FROM requests
+GROUP BY upstream_model ORDER BY est_usd DESC;
+```
+
+Output throughput (tokens/sec) by model, streaming turns only:
+
+```sql
+SELECT upstream_model,
+       round(avg(output_tokens_per_sec), 1) AS avg_tok_per_sec,
+       round(avg(ttft_ms))                  AS avg_ttft_ms
+FROM requests
+WHERE stream AND output_tokens_per_sec IS NOT NULL
+GROUP BY upstream_model;
+```
 
 ## Troubleshooting
 
@@ -327,13 +435,15 @@ The `gh` token may have expired. Restart the proxy to refresh it.
 
 ```
 cc-gh-proxy/
-├── cc-gh-proxy.py   # The proxy server
-├── test.sh          # End-to-end test suite
-├── CLAUDE.md        # Project context for Claude Code
-├── LICENSE          # MIT
-└── logs/            # Created at runtime (gitignored)
+├── cc-gh-proxy.py             # The proxy server
+├── test.sh                    # End-to-end test suite
+├── requirements-telemetry.txt # Optional: duckdb, for telemetry
+├── CLAUDE.md                  # Project context for Claude Code
+├── LICENSE                    # MIT
+└── logs/                      # Created at runtime (gitignored)
     ├── proxy.log
-    └── requests.jsonl
+    ├── requests.jsonl
+    └── usage.duckdb           # Telemetry DB (when duckdb is installed)
 ```
 
 ## License

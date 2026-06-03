@@ -220,6 +220,24 @@ Caveats:
 The first run prints a device-flow URL and code; visit GitHub to authorize
 the Copilot OAuth app. The token is cached under `~/.config/cc-gh-proxy/`.
 
+### Using Cursor (or any OpenAI-compatible client) with Copilot
+
+The proxy also exposes a raw OpenAI `/chat/completions` passthrough so tools
+like Cursor that only speak the OpenAI API can use your Copilot subscription.
+No translation — the body is forwarded unchanged to Copilot's OpenAI endpoint.
+
+```bash
+./cc-gh-proxy.py --copilot-auth
+```
+
+In Cursor: Settings → Models → "Override OpenAI Base URL" =
+`http://localhost:4000/v1`. Use any Copilot-supported model name (`gpt-4o`,
+`gpt-5-mini`, etc.). If you set `--api-key`, paste it as the OpenAI API key —
+the proxy accepts it via either `x-api-key` or `Authorization: Bearer`.
+
+Only `/chat/completions` and `/models` are exposed. OpenAI's `/responses`
+endpoint (used by Codex) is not — Copilot doesn't implement it.
+
 ### WebSearch via Tavily
 
 GitHub Copilot **does not execute Anthropic's server-side tools** like

@@ -70,6 +70,9 @@ _no_opus_target: str = "claude-sonnet-4.6"  # Target sonnet model when --no-opus
 
 # Telemetry (DuckDB) — set in main(). When _telemetry is None, telemetry is off.
 _telemetry: TelemetryWriter | None = None
+# Optional override for the Claude Code projects dir (used to resolve session
+# names). None -> auto-detect (CLAUDE_CONFIG_DIR or ~/.claude). Set in main().
+_claude_projects_dir: Path | None = None
 
 # Tavily configuration. When set, Claude Code's "WebSearch executor" requests
 # (the small follow-up call CC fires with tools=[web_search_*]) are served by
@@ -218,6 +221,14 @@ def parse_args() -> argparse.Namespace:
         help="seconds between DuckDB flushes. The writer opens/appends/closes "
              "the file each flush so duckdb.exe can query it between flushes "
              "(env: PROXY_DUCKDB_FLUSH_INTERVAL, default: 2.0)",
+    )
+    p.add_argument(
+        "--claude-projects-dir",
+        default=os.environ.get("PROXY_CLAUDE_PROJECTS_DIR"),
+        help="path to Claude Code's projects directory, used to resolve the "
+             "session_name (customTitle) telemetry column. Defaults to "
+             "CLAUDE_CONFIG_DIR/projects or ~/.claude/projects "
+             "(env: PROXY_CLAUDE_PROJECTS_DIR)",
     )
     return p.parse_args()
 
@@ -1438,6 +1449,7 @@ TELEMETRY_COLUMNS: tuple[tuple[str, str], ...] = (
     ("request_id", "TEXT PRIMARY KEY"),
     ("ts", "TIMESTAMP"),
     ("session_id", "TEXT"),
+    ("session_name", "TEXT"),
     ("account_id", "TEXT"),
     ("response_message_id", "TEXT"),
     ("requested_model", "TEXT"),
@@ -1528,6 +1540,88 @@ def parse_user_id(user_id: str | None) -> tuple[str | None, str | None]:
     return m.group("session") or None, m.group("account") or None
 
 
+# Session-name resolution -----------------------------------------------------
+# Claude Code stores each conversation transcript at
+#   <claude-config-dir>/projects/<encoded-cwd>/<session-id>.jsonl
+# whose header line carries a human-readable "customTitle" (set via /rename,
+# accepting a plan, etc.). We resolve session_id -> name by globbing for that
+# file and reading the title. Results are cached with a TTL so renames are
+# eventually picked up without re-scanning on every request.
+_SESSION_NAME_TTL: float = 300.0  # seconds
+_session_name_cache: dict[str, tuple[float, str | None]] = {}
+_session_name_lock: threading.Lock = threading.Lock()
+
+
+def claude_projects_dir() -> Path:
+    """Return the Claude Code projects directory (cross-platform).
+
+    Resolution order:
+      1. --claude-projects-dir / PROXY_CLAUDE_PROJECTS_DIR (explicit override)
+      2. CLAUDE_CONFIG_DIR/projects (Claude Code's own override env var)
+      3. ~/.claude/projects (default; Path.home() handles Windows + POSIX)
+    """
+    if _claude_projects_dir is not None:
+        return _claude_projects_dir
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg:
+        return Path(cfg) / "projects"
+    return Path.home() / ".claude" / "projects"
+
+
+def _read_custom_title(path: Path) -> str | None:
+    """Read the `customTitle` from a transcript's header lines, if present."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for _ in range(20):  # title lives in the header; scan a few lines
+                line = f.readline()
+                if not line:
+                    break
+                if '"customTitle"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                title = obj.get("customTitle")
+                if isinstance(title, str) and title.strip():
+                    return title.strip()
+    except OSError:
+        return None
+    return None
+
+
+def lookup_session_name(session_id: str | None) -> str | None:
+    """Resolve a Claude Code session UUID to its human-readable name.
+
+    Returns None if no transcript or no customTitle is found. Cached with a
+    TTL (negative results too, so unnamed sessions don't re-scan constantly).
+    Safe to call from the writer thread; never raises.
+    """
+    if not session_id:
+        return None
+    now = time.monotonic()
+    with _session_name_lock:
+        cached = _session_name_cache.get(session_id)
+        if cached is not None and now - cached[0] < _SESSION_NAME_TTL:
+            return cached[1]
+
+    name: str | None = None
+    try:
+        projects = claude_projects_dir()
+        if projects.is_dir():
+            # session_id is a UUID, so the filename is unique across projects.
+            for p in projects.glob(f"**/{session_id}.jsonl"):
+                name = _read_custom_title(p)
+                if name:
+                    break
+    except OSError:
+        name = None
+
+    with _session_name_lock:
+        _session_name_cache[session_id] = (now, name)
+    return name
+
+
 def build_request_tel(
     parsed_body: JsonDict,
     *,
@@ -1564,6 +1658,7 @@ def build_request_tel(
         "request_id": request_id,
         "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
         "session_id": session_id,
+        "session_name": None,  # resolved in the writer thread (off hot path)
         "account_id": account_id,
         "response_message_id": None,
         "requested_model": requested_model,
@@ -1692,14 +1787,30 @@ class TelemetryWriter:
         )
 
     def start(self) -> None:
-        # Validate we can open the DB and create the table up-front; if this
-        # fails, the caller disables telemetry rather than starting the thread.
+        # Validate we can open the DB and create/migrate the table up-front; if
+        # this fails, the caller disables telemetry rather than starting the thread.
         con = duckdb.connect(str(self._db_path))
         try:
-            con.execute(TELEMETRY_DDL)
+            self._ensure_schema(con)
         finally:
             con.close()
         self._thread.start()
+
+    def _ensure_schema(self, con: Any) -> None:
+        """Create the table if missing, and add any columns absent from an
+        older DB (so the schema can evolve without dropping existing data)."""
+        con.execute(TELEMETRY_DDL)
+        existing = {
+            row[0] for row in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'requests'"
+            ).fetchall()
+        }
+        for name, decl in TELEMETRY_COLUMNS:
+            if name not in existing:
+                col_type = decl.replace("PRIMARY KEY", "").strip()
+                con.execute(f"ALTER TABLE requests ADD COLUMN {name} {col_type}")
+                logger.info("Telemetry: added new column '%s' to requests table", name)
 
     def enqueue(self, row: dict[str, Any]) -> None:
         self._q.put(row)
@@ -1773,7 +1884,12 @@ class TelemetryWriter:
             return False
         self._lock_warned = False
         try:
-            con.execute(TELEMETRY_DDL)
+            self._ensure_schema(con)
+            # Resolve session names off the request hot path, here in the
+            # writer thread (cached, so this is cheap for repeated sessions).
+            for r in batch:
+                if r.get("session_id") and not r.get("session_name"):
+                    r["session_name"] = lookup_session_name(r["session_id"])
             placeholders = ", ".join("?" for _ in self._col_names)
             sql = (
                 f"INSERT OR IGNORE INTO requests ({', '.join(self._col_names)}) "
@@ -3243,6 +3359,7 @@ if __name__ == "__main__":
     _tavily_api_key = args.tavily_api_key
     _tavily_search_depth = args.tavily_search_depth
     _tavily_max_results = args.tavily_max_results
+    _claude_projects_dir = Path(args.claude_projects_dir) if args.claude_projects_dir else None
 
     setup_logging(_log_dir, args.log_level, verbose=args.verbose)
 
@@ -3319,6 +3436,7 @@ if __name__ == "__main__":
             "  Telemetry: ENABLED -> %s (flush every %.1fs)",
             _telemetry._db_path, args.duckdb_flush_interval,
         )
+        banner("  Session names: resolved from %s", claude_projects_dir())
     elif not args.no_duckdb and duckdb is not None:
         banner("  Telemetry: disabled (init failed)")
     else:

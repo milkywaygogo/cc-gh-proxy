@@ -303,6 +303,7 @@ All options can be set via CLI arguments or environment variables. CLI takes pre
 | `--duckdb-path`       | `PROXY_DUCKDB_PATH`       | `<log-dir>/usage.duckdb` | DuckDB file for per-request telemetry (see below)      |
 | `--no-duckdb`         | `PROXY_NO_DUCKDB`         | off                   | Disable DuckDB telemetry entirely                          |
 | `--duckdb-flush-interval` | `PROXY_DUCKDB_FLUSH_INTERVAL` | `2.0`           | Seconds between DuckDB flushes                             |
+| `--claude-projects-dir` | `PROXY_CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | Claude Code projects dir used to resolve `session_name`    |
 
 ### API key authentication
 
@@ -364,7 +365,7 @@ is a derived index you can always rebuild from the log.
 
 The `requests` table is created automatically. Key columns:
 
-- **identity**: `request_id`, `ts`, `session_id`, `account_id`, `response_message_id`
+- **identity**: `request_id`, `ts`, `session_id`, `session_name`, `account_id`, `response_message_id`
 - **model**: `requested_model`, `upstream_model`, `downgraded`, `downgrade_to`
 - **routing**: `route` (`native`/`openai`/`local`/`tavily`), `upstream_host`, `retry_count`, `beta_requested`, `beta_stripped`
 - **request shape**: `n_messages`, `system_bytes`, `tool_count`, `tool_names`, `max_tokens`, `temperature`, `top_p`, `top_k`, `thinking_enabled`, `thinking_budget`, `stream`, `req_bytes`
@@ -378,6 +379,22 @@ The `requests` table is created automatically. Key columns:
 > `cc-gh-proxy.py` to adjust rates. Cache columns are only populated on the
 > `native` Claude route; translated `openai`/`local`/`tavily` rows leave them 0.
 
+### Session names
+
+`session_name` is the human-readable conversation title (`customTitle`) that
+Claude Code stores in each transcript — set via `/rename`, `claude -n <name>`,
+`Ctrl+R` in the resume picker, or auto-named when you accept a plan. The proxy
+resolves it by locating the session's transcript at
+`<projects-dir>/<encoded-cwd>/<session-id>.jsonl` and reading the title from its
+header line. Lookups happen in the telemetry writer thread (off the request hot
+path) and are cached for 5 minutes, so renames are eventually reflected.
+
+The projects directory defaults to `~/.claude/projects` and works on both
+Windows and Linux (`Path.home()` honors `%USERPROFILE%`). Override with
+`--claude-projects-dir`, or it auto-follows Claude Code's own `CLAUDE_CONFIG_DIR`
+when set. Sessions that were never renamed have no `customTitle`, so
+`session_name` is left `NULL` for them.
+
 ### Example queries
 
 Tokens and cost-equivalent per session (a conversation; note it may split
@@ -385,6 +402,7 @@ across `/resume` if Claude Code starts a new session id):
 
 ```sql
 SELECT session_id,
+       any_value(session_name)        AS name,
        count(*)                       AS turns,
        sum(input_tokens)              AS input,
        sum(output_tokens)             AS output,

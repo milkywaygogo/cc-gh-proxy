@@ -226,7 +226,7 @@ def parse_args() -> argparse.Namespace:
         "--claude-projects-dir",
         default=os.environ.get("PROXY_CLAUDE_PROJECTS_DIR"),
         help="path to Claude Code's projects directory, used to resolve the "
-             "session_name (customTitle) telemetry column. Defaults to "
+             "session_name telemetry column. Defaults to "
              "CLAUDE_CONFIG_DIR/projects or ~/.claude/projects "
              "(env: PROXY_CLAUDE_PROJECTS_DIR)",
     )
@@ -1543,10 +1543,12 @@ def parse_user_id(user_id: str | None) -> tuple[str | None, str | None]:
 # Session-name resolution -----------------------------------------------------
 # Claude Code stores each conversation transcript at
 #   <claude-config-dir>/projects/<encoded-cwd>/<session-id>.jsonl
-# whose header line carries a human-readable "customTitle" (set via /rename,
-# accepting a plan, etc.). We resolve session_id -> name by globbing for that
-# file and reading the title. Results are cached with a TTL so renames are
-# eventually picked up without re-scanning on every request.
+# and *appends* a human-readable title line as the conversation grows. Two
+# shapes exist: the auto-generated "ai-title"/"aiTitle" (the common case) and
+# the explicit "custom-title"/"customTitle" set via /rename. We resolve
+# session_id -> name by globbing for that file and reading the title. Results
+# are cached with a TTL so renames are eventually picked up without re-scanning
+# on every request.
 _SESSION_NAME_TTL: float = 300.0  # seconds
 _session_name_cache: dict[str, tuple[float, str | None]] = {}
 _session_name_lock: threading.Lock = threading.Lock()
@@ -1568,34 +1570,59 @@ def claude_projects_dir() -> Path:
     return Path.home() / ".claude" / "projects"
 
 
-def _read_custom_title(path: Path) -> str | None:
-    """Read the `customTitle` from a transcript's header lines, if present."""
+def _read_session_title(path: Path) -> str | None:
+    """Read the current human-readable title from a transcript, if present.
+
+    Claude Code records the title as a standalone line it *appends* whenever
+    the title is (re)generated — typically after several messages, so it is
+    NOT in the header. Two line shapes exist:
+      - {"type": "ai-title", "aiTitle": ...}         — auto-generated; the
+        newer format and the common case for almost every session.
+      - {"type": "custom-title", "customTitle": ...} — set explicitly via
+        /rename; the legacy format and an explicit user override.
+
+    We scan the whole file and keep the last line of each kind (titles are
+    re-emitted as the conversation grows, so last-one-wins). An explicit
+    custom-title takes precedence over the auto-generated ai-title; otherwise
+    the ai-title is used. Returns None when neither is present (e.g. sessions
+    too short to have been titled). (An earlier version read only
+    `custom-title`, so every session that had only an auto ai-title — i.e. most
+    of them — resolved to NULL.)
+    """
+    custom: str | None = None
+    ai: str | None = None
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            for _ in range(20):  # title lives in the header; scan a few lines
-                line = f.readline()
-                if not line:
-                    break
-                if '"customTitle"' not in line:
+            for line in f:
+                if "-title" not in line:  # cheap pre-filter before JSON parse
                     continue
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                title = obj.get("customTitle")
-                if isinstance(title, str) and title.strip():
-                    return title.strip()
+                if not isinstance(obj, dict):
+                    continue
+                ttype = obj.get("type")
+                if ttype == "custom-title":
+                    val = obj.get("customTitle")
+                    if isinstance(val, str) and val.strip():
+                        custom = val.strip()  # keep scanning; last one wins
+                elif ttype == "ai-title":
+                    val = obj.get("aiTitle")
+                    if isinstance(val, str) and val.strip():
+                        ai = val.strip()
     except OSError:
         return None
-    return None
+    # Explicit user rename wins over the auto-generated title.
+    return custom or ai
 
 
 def lookup_session_name(session_id: str | None) -> str | None:
     """Resolve a Claude Code session UUID to its human-readable name.
 
-    Returns None if no transcript or no customTitle is found. Cached with a
-    TTL (negative results too, so unnamed sessions don't re-scan constantly).
-    Safe to call from the writer thread; never raises.
+    Returns None if no transcript or no title (ai-title/custom-title) is found.
+    Cached with a TTL (negative results too, so unnamed sessions don't re-scan
+    constantly). Safe to call from the writer thread; never raises.
     """
     if not session_id:
         return None
@@ -1611,7 +1638,7 @@ def lookup_session_name(session_id: str | None) -> str | None:
         if projects.is_dir():
             # session_id is a UUID, so the filename is unique across projects.
             for p in projects.glob(f"**/{session_id}.jsonl"):
-                name = _read_custom_title(p)
+                name = _read_session_title(p)
                 if name:
                     break
     except OSError:

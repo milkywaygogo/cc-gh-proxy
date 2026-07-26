@@ -65,6 +65,7 @@ _log_requests: bool = False  # Log request/response content (opt-in)
 _upstream_model: str | None = None  # Override model for all requests
 _upstream_base_url: str | None = None  # OpenAI-compatible upstream URL (bypasses Copilot)
 _upstream_api_key: str | None = None  # Bearer token for --upstream-base-url
+_opus_model: str = "claude-opus-5"  # Every claude-opus-* request resolves here
 _no_opus: bool = False  # Map any claude-opus-* request to a sonnet model
 _no_opus_target: str = "claude-sonnet-4.6"  # Target sonnet model when --no-opus is set
 
@@ -128,7 +129,7 @@ def parse_args() -> argparse.Namespace:
         "--upstream-model",
         default=os.environ.get("PROXY_UPSTREAM_MODEL"),
         help="force all requests to use this model (env: PROXY_UPSTREAM_MODEL). "
-             "Claude models (claude-opus-4.6, claude-sonnet-4.6, claude-haiku-4.5) use "
+             "Claude models (claude-opus-5, claude-sonnet-4.6, claude-haiku-4.5) use "
              "native pass-through. Non-Claude models require --copilot-auth and OpenAI "
              "translation (EXPERIMENTAL). Available: gpt-5-mini (0x), gpt-4.1 (0x), "
              "gpt-5.1, gpt-5.2, gpt-4o, gemini-2.5-pro, grok-code-fast-1. "
@@ -179,6 +180,14 @@ def parse_args() -> argparse.Namespace:
              "(env: PROXY_TAVILY_MAX_RESULTS, default: 5)",
     )
     p.add_argument(
+        "--opus-model",
+        default=os.environ.get("PROXY_OPUS_MODEL", "claude-opus-5"),
+        help="Copilot model that every claude-opus-* request resolves to, "
+             "regardless of the version Claude Code asks for "
+             "(env: PROXY_OPUS_MODEL, default: claude-opus-5). Copilot ships "
+             "claude-opus-4.6, 4.7, 4.8 and 5. Ignored when --no-opus is set",
+    )
+    p.add_argument(
         "--no-opus",
         action="store_true",
         default=os.environ.get("PROXY_NO_OPUS", "").lower() in ("1", "true", "yes"),
@@ -191,7 +200,7 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("PROXY_NO_OPUS_TARGET", "claude-sonnet-4.6"),
         help="target Copilot model when --no-opus rewrites an Opus request "
              "(env: PROXY_NO_OPUS_TARGET, default: claude-sonnet-4.6). "
-             "Copilot currently only ships Sonnet 4.6 and 4.5, not 4.7",
+             "Copilot currently ships Sonnet 4.5, 4.6 and 5",
     )
     p.add_argument(
         "-v", "--verbose",
@@ -669,26 +678,31 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 # Module-level constants for model name mapping (avoid rebuilding per call)
+# Opus is absent here on purpose: every Opus request is pinned by _resolve_opus.
 _MODEL_STATIC_MAP: dict[str, str] = {
-    "claude-opus-4-6": "claude-opus-4.6",
     "claude-sonnet-4-6": "claude-sonnet-4.6",
     "claude-haiku-4-5": "claude-haiku-4.5",
 }
 _MODEL_FAMILY_MAP: dict[str, str] = {
-    "claude-opus-4": "claude-opus-4.6",
     "claude-sonnet-4": "claude-sonnet-4.6",
     "claude-haiku-4": "claude-haiku-4.5",
 }
 
 
-def _opus_to_sonnet(name: str) -> str:
-    """If --no-opus is enabled, rewrite any claude-opus-* model to the configured
-    sonnet target. Version is NOT preserved because Copilot does not ship a sonnet
-    for every opus version (e.g. opus 4.7 has no matching sonnet 4.7)."""
-    if _no_opus and name.startswith("claude-opus-"):
+def _resolve_opus(name: str) -> str:
+    """Resolve a claude-opus-* request to the Opus model actually sent upstream.
+
+    --no-opus wins when set. Version is NOT preserved in either direction:
+    Copilot does not ship a sonnet for every opus version (e.g. opus 4.7 has no
+    matching sonnet 4.7), and pinning Opus keeps Claude Code's dated model IDs
+    from silently selecting an older Opus than the one configured.
+    """
+    if _no_opus:
         logger.info("Downgrading %s -> %s (--no-opus)", name, _no_opus_target)
         return _no_opus_target
-    return name
+    if name != _opus_model:
+        logger.info("Pinning %s -> %s (--opus-model)", name, _opus_model)
+    return _opus_model
 
 
 def map_model_name(model: str) -> str:
@@ -697,30 +711,30 @@ def map_model_name(model: str) -> str:
     Claude Code may send:
       claude-opus-4-6, claude-opus-4-6[1m], claude-opus-4-6-20260312, etc.
     Copilot expects:
-      claude-opus-4.6, claude-sonnet-4.6, claude-haiku-4.5
+      claude-opus-5, claude-sonnet-4.6, claude-haiku-4.5
     """
     # Strip bracket suffixes: claude-opus-4-6[1m] -> claude-opus-4-6
     model = re.sub(r"\[[^\]]*\]$", "", model)
-
-    if model in _MODEL_STATIC_MAP:
-        return _opus_to_sonnet(_MODEL_STATIC_MAP[model])
-
     # Strip date suffixes: claude-opus-4-6-20260312 -> claude-opus-4-6
     stripped: str = re.sub(r"-\d{8}$", "", model)
+
+    if stripped == "claude-opus" or stripped.startswith("claude-opus-"):
+        return _resolve_opus(stripped)
+
     if stripped in _MODEL_STATIC_MAP:
-        return _opus_to_sonnet(_MODEL_STATIC_MAP[stripped])
+        return _MODEL_STATIC_MAP[stripped]
 
     # Pattern: claude-{tier}-{major}-{minor} -> claude-{tier}-{major}.{minor}
-    m = re.match(r"^(claude-(?:opus|sonnet|haiku)-\d+)-(\d+)$", stripped)
+    m = re.match(r"^(claude-(?:sonnet|haiku)-\d+)-(\d+)$", stripped)
     if m:
-        return _opus_to_sonnet(f"{m.group(1)}.{m.group(2)}")
+        return f"{m.group(1)}.{m.group(2)}"
 
-    # Base family: claude-opus-4 -> claude-opus-4.6 (latest known)
+    # Base family: claude-sonnet-4 -> claude-sonnet-4.6 (latest known)
     if stripped in _MODEL_FAMILY_MAP:
-        return _opus_to_sonnet(_MODEL_FAMILY_MAP[stripped])
+        return _MODEL_FAMILY_MAP[stripped]
 
     logger.warning("Unknown model '%s', passing through as-is", model)
-    return _opus_to_sonnet(model)
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -1437,9 +1451,12 @@ def openai_stream_to_anthropic_events(raw: str, model: str) -> str:
 # Keyed by the upstream (dotted) model name. Add rows as new models ship.
 PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4.6":   {"in": 15.0, "out": 75.0, "cache_read": 1.50, "cache_write": 18.75, "premium": 10.0},
+    "claude-opus-4.7":   {"in": 15.0, "out": 75.0, "cache_read": 1.50, "cache_write": 18.75, "premium": 10.0},
     "claude-opus-4.8":   {"in": 15.0, "out": 75.0, "cache_read": 1.50, "cache_write": 18.75, "premium": 10.0},
+    "claude-opus-5":     {"in": 15.0, "out": 75.0, "cache_read": 1.50, "cache_write": 18.75, "premium": 10.0},
     "claude-sonnet-4.6": {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75,  "premium": 1.0},
     "claude-sonnet-4.5": {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75,  "premium": 1.0},
+    "claude-sonnet-5":   {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75,  "premium": 1.0},
     "claude-haiku-4.5":  {"in": 1.0,  "out": 5.0,  "cache_read": 0.10, "cache_write": 1.25,  "premium": 0.33},
 }
 
@@ -3381,6 +3398,7 @@ if __name__ == "__main__":
     _upstream_model = args.upstream_model
     _upstream_base_url = args.upstream_base_url
     _upstream_api_key = args.upstream_api_key
+    _opus_model = args.opus_model
     _no_opus = args.no_opus
     _no_opus_target = args.no_opus_target
     _tavily_api_key = args.tavily_api_key
@@ -3451,6 +3469,8 @@ if __name__ == "__main__":
         banner("  OpenAI /chat/completions passthrough: ENABLED (Copilot upstream)")
     if _no_opus:
         banner("  Opus downgrade: ENABLED (claude-opus-* -> %s)", _no_opus_target)
+    else:
+        banner("  Opus model: claude-opus-* -> %s", _opus_model)
     if _tavily_api_key:
         banner(
             "  Tavily search: ENABLED -> %s (depth=%s, max_results=%d)",

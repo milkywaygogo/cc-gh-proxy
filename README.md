@@ -12,7 +12,7 @@ Claude Code ──► localhost:4000 ──► api.githubcopilot.com
 GitHub Copilot natively supports the Anthropic Messages API, so the proxy is a
 thin pass-through that only:
 1. Swaps the auth header (gh CLI OAuth token)
-2. Maps model names (`claude-opus-4-6` -> `claude-opus-4.6`)
+2. Maps model names (`claude-sonnet-4-6` -> `claude-sonnet-4.6`)
 3. Strips unsupported `cache_control` fields
 
 No format conversion. Real token counts. Native streaming.
@@ -60,7 +60,7 @@ GH_TOKEN=$(gh auth token)
 curl -s -H "Authorization: Bearer $GH_TOKEN" \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
-  -d '{"model":"claude-opus-4.6","messages":[{"role":"user","content":"Say hello"}],"max_tokens":5}' \
+  -d '{"model":"claude-opus-5","messages":[{"role":"user","content":"Say hello"}],"max_tokens":5}' \
   https://api.githubcopilot.com/v1/messages
 ```
 
@@ -146,15 +146,40 @@ kill $(lsof -ti:4000)
 
 | Claude Code sends     | Copilot receives      |
 |-----------------------|-----------------------|
-| `claude-opus-4-6`     | `claude-opus-4.6`     |
+| `claude-opus-4-6`     | `claude-opus-5`       |
+| `claude-opus-4-8`     | `claude-opus-5`       |
 | `claude-sonnet-4-6`   | `claude-sonnet-4.6`   |
 | `claude-haiku-4-5`    | `claude-haiku-4.5`    |
 
-Date-stamped variants (e.g. `claude-opus-4-6-20260312`) and base family names
-(e.g. `claude-opus-4`) are also mapped automatically. Newer minor versions
-(e.g. `claude-opus-4-7` -> `claude-opus-4.7`) are forwarded through the same
-pattern, but Copilot only accepts versions it actually ships - check with the
-Copilot status page if you get HTTP 400 `model_not_supported`.
+Date-stamped variants (e.g. `claude-sonnet-4-6-20260312`) and base family names
+(e.g. `claude-sonnet-4`) are also mapped automatically. Copilot only accepts
+versions it actually ships - check the Copilot model list if you get HTTP 400
+`model_not_supported`.
+
+### Opus pinning (`--opus-model`)
+
+Every incoming `claude-opus-*` request resolves to a single Opus model,
+regardless of the version Claude Code asks for. The default is
+`claude-opus-5`, the newest Opus that Copilot ships. This exists because
+Claude Code hardcodes dated model IDs, which would otherwise keep routing to
+an older Opus long after a newer one is available.
+
+```bash
+./cc-gh-proxy.py                                  # -> claude-opus-5
+./cc-gh-proxy.py --opus-model claude-opus-4.8     # pin an older Opus
+```
+
+Copilot currently ships `claude-opus-4.6`, `claude-opus-4.7`,
+`claude-opus-4.8`, and `claude-opus-5`. To see the live list:
+
+```bash
+curl -s -H "Authorization: Bearer $(gh auth token)" \
+  -H "Copilot-Integration-Id: vscode-chat" \
+  https://api.githubcopilot.com/models | python3 -m json.tool
+```
+
+Sonnet and Haiku are unaffected and keep normal version mapping.
+`--no-opus` takes precedence over `--opus-model` when both are set.
 
 ## Routing modes
 
@@ -295,7 +320,8 @@ All options can be set via CLI arguments or environment variables. CLI takes pre
 | `--copilot-auth`      | `PROXY_COPILOT_AUTH`      | off                   | Use Copilot OAuth app (required for non-Claude models)     |
 | `--upstream-base-url` | `PROXY_UPSTREAM_BASE_URL` | *(none)*              | OpenAI-compatible base URL (bypasses Copilot)              |
 | `--upstream-api-key`  | `PROXY_UPSTREAM_API_KEY`  | *(none)*              | Bearer token for `--upstream-base-url`                     |
-| `--no-opus`           | `PROXY_NO_OPUS`           | off                   | Rewrite `claude-opus-*` to `--no-opus-target`              |
+| `--opus-model`        | `PROXY_OPUS_MODEL`        | `claude-opus-5`       | Model every `claude-opus-*` request resolves to            |
+| `--no-opus`           | `PROXY_NO_OPUS`           | off                   | Rewrite `claude-opus-*` to `--no-opus-target` instead      |
 | `--no-opus-target`    | `PROXY_NO_OPUS_TARGET`    | `claude-sonnet-4.6`   | Target model for `--no-opus` rewrites                      |
 | `--tavily-api-key`    | `PROXY_TAVILY_API_KEY`    | *(none)*              | Enable Tavily WebSearch interception (see below)           |
 | `--tavily-search-depth` | `PROXY_TAVILY_SEARCH_DEPTH` | `advanced`        | Tavily depth: `basic` ($0.005) or `advanced` ($0.008)      |

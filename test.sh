@@ -86,19 +86,30 @@ spec = importlib.util.spec_from_file_location("proxy", sys.argv[1])
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
+# Every Opus request pins to _opus_model regardless of the version requested.
 cases_default = [
-    ("claude-opus-4-6",          "claude-opus-4.6"),
-    ("claude-opus-4-7",          "claude-opus-4.7"),
-    ("claude-opus-4-6[1m]",      "claude-opus-4.6"),
-    ("claude-opus-4-6-20260312", "claude-opus-4.6"),
-    ("claude-opus-4",            "claude-opus-4.6"),
+    ("claude-opus-4-6",          "claude-opus-5"),
+    ("claude-opus-4-7",          "claude-opus-5"),
+    ("claude-opus-4-6[1m]",      "claude-opus-5"),
+    ("claude-opus-4-6-20260312", "claude-opus-5"),
+    ("claude-opus-4",            "claude-opus-5"),
+    ("claude-opus-5",            "claude-opus-5"),
     ("claude-sonnet-4-6",        "claude-sonnet-4.6"),
+    ("claude-sonnet-4-5",        "claude-sonnet-4.5"),
+    ("claude-sonnet-4",          "claude-sonnet-4.6"),
     ("claude-haiku-4-5",         "claude-haiku-4.5"),
 ]
 mod._no_opus = False
 for src, want in cases_default:
     got = mod.map_model_name(src)
     assert got == want, f"default: {src} -> {got}, expected {want}"
+
+# A different --opus-model is honored for every Opus spelling
+mod._opus_model = "claude-opus-4.8"
+for src in ("claude-opus-4-6", "claude-opus-4", "claude-opus-5"):
+    got = mod.map_model_name(src)
+    assert got == "claude-opus-4.8", f"--opus-model: {src} -> {got}"
+mod._opus_model = "claude-opus-5"
 
 mod._no_opus = True
 mod._no_opus_target = "claude-sonnet-4.6"
@@ -108,6 +119,7 @@ opus_inputs = [
     "claude-opus-4-6[1m]",
     "claude-opus-4-7-20260512",
     "claude-opus-4",
+    "claude-opus-5",
 ]
 for src in opus_inputs:
     got = mod.map_model_name(src)

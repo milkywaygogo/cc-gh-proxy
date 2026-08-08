@@ -67,7 +67,7 @@ _upstream_base_url: str | None = None  # OpenAI-compatible upstream URL (bypasse
 _upstream_api_key: str | None = None  # Bearer token for --upstream-base-url
 _opus_model: str = "claude-opus-5"  # Every claude-opus-* request resolves here
 _no_opus: bool = False  # Map any claude-opus-* request to a sonnet model
-_no_opus_target: str = "claude-sonnet-4.6"  # Target sonnet model when --no-opus is set
+_no_opus_target: str = "claude-sonnet-5"  # Target sonnet model when --no-opus is set
 
 # Telemetry (DuckDB) — set in main(). When _telemetry is None, telemetry is off.
 _telemetry: TelemetryWriter | None = None
@@ -181,11 +181,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--opus-model",
-        default=os.environ.get("PROXY_OPUS_MODEL", "claude-opus-5"),
+        default=os.environ.get("PROXY_OPUS_MODEL"),
         help="Copilot model that every claude-opus-* request resolves to, "
              "regardless of the version Claude Code asks for "
-             "(env: PROXY_OPUS_MODEL, default: claude-opus-5). Copilot ships "
-             "claude-opus-4.6, 4.7, 4.8 and 5. Ignored when --no-opus is set",
+             "(env: PROXY_OPUS_MODEL). When unset, auto-discovered at startup "
+             "from GET /models (fallback: claude-opus-5). Ignored when "
+             "--no-opus is set",
     )
     p.add_argument(
         "--no-opus",
@@ -197,10 +198,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--no-opus-target",
-        default=os.environ.get("PROXY_NO_OPUS_TARGET", "claude-sonnet-4.6"),
+        default=os.environ.get("PROXY_NO_OPUS_TARGET"),
         help="target Copilot model when --no-opus rewrites an Opus request "
-             "(env: PROXY_NO_OPUS_TARGET, default: claude-sonnet-4.6). "
-             "Copilot currently ships Sonnet 4.5, 4.6 and 5",
+             "(env: PROXY_NO_OPUS_TARGET). When unset, auto-discovered at "
+             "startup as the newest Sonnet from GET /models "
+             "(fallback: claude-sonnet-5)",
     )
     p.add_argument(
         "-v", "--verbose",
@@ -683,10 +685,146 @@ _MODEL_STATIC_MAP: dict[str, str] = {
     "claude-sonnet-4-6": "claude-sonnet-4.6",
     "claude-haiku-4-5": "claude-haiku-4.5",
 }
+_FALLBACK_OPUS_MODEL: str = "claude-opus-5"
+_FALLBACK_SONNET_MODEL: str = "claude-sonnet-5"
+_FALLBACK_HAIKU_MODEL: str = "claude-haiku-4.5"
+# Fallback defaults used before / until startup discovery refreshes them.
+# Bare ``claude-sonnet`` / ``claude-haiku`` always resolve to the series latest.
 _MODEL_FAMILY_MAP: dict[str, str] = {
-    "claude-sonnet-4": "claude-sonnet-4.6",
+    "claude-sonnet": _FALLBACK_SONNET_MODEL,
+    "claude-sonnet-4": "claude-sonnet-4.6",  # latest within major 4, not absolute newest
+    "claude-haiku": _FALLBACK_HAIKU_MODEL,
     "claude-haiku-4": "claude-haiku-4.5",
 }
+# Populated by startup discovery (may be empty if fetch failed / skipped).
+_latest_claude_models: dict[str, str] = {}
+
+# Shared editor headers for Copilot /models and chat/completions auth.
+_COPILOT_EDITOR_HEADERS: dict[str, str] = {
+    "Editor-Version": "vscode/1.96.0",
+    "Editor-Plugin-Version": "copilot/1.200.0",
+    "User-Agent": "GithubCopilot/1.200.0",
+    "Copilot-Integration-Id": "vscode-chat",
+}
+
+# claude-{tier}-{major}[.{minor}][-suffix]  e.g. claude-opus-5, claude-sonnet-4.6,
+# claude-opus-4.8-fast
+_CLAUDE_MODEL_ID_RE: re.Pattern[str] = re.compile(
+    r"^claude-(?P<tier>opus|sonnet|haiku)-"
+    r"(?P<major>\d+)(?:\.(?P<minor>\d+))?"
+    r"(?:-(?P<suffix>.+))?$"
+)
+
+
+def _claude_model_sort_key(model_id: str) -> tuple[int, int, int] | None:
+    """Sort key for Copilot Claude IDs: higher major/minor wins; bare > -fast."""
+    m = _CLAUDE_MODEL_ID_RE.match(model_id)
+    if not m:
+        return None
+    major: int = int(m.group("major"))
+    minor: int = int(m.group("minor") or 0)
+    bare: int = 1 if m.group("suffix") is None else 0
+    return (major, minor, bare)
+
+
+def discover_latest_claude_models(model_ids: list[str]) -> dict[str, str]:
+    """Return newest model id per tier (opus/sonnet/haiku) from a catalog."""
+    best: dict[str, tuple[tuple[int, int, int], str]] = {}
+    for mid in model_ids:
+        m = _CLAUDE_MODEL_ID_RE.match(mid)
+        if not m:
+            continue
+        key = _claude_model_sort_key(mid)
+        if key is None:
+            continue
+        tier: str = m.group("tier")
+        prev = best.get(tier)
+        if prev is None or key > prev[0]:
+            best[tier] = (key, mid)
+    return {tier: mid for tier, (_, mid) in best.items()}
+
+
+def build_family_map(model_ids: list[str]) -> dict[str, str]:
+    """Map ``claude-{sonnet|haiku}-{major}`` → newest model of that major."""
+    best_major: dict[tuple[str, int], tuple[tuple[int, int, int], str]] = {}
+    for mid in model_ids:
+        m = _CLAUDE_MODEL_ID_RE.match(mid)
+        if not m:
+            continue
+        key = _claude_model_sort_key(mid)
+        if key is None:
+            continue
+        tier: str = m.group("tier")
+        if tier == "opus":
+            continue  # opus always goes through _resolve_opus
+        major: int = int(m.group("major"))
+        slot: tuple[str, int] = (tier, major)
+        prev = best_major.get(slot)
+        if prev is None or key > prev[0]:
+            best_major[slot] = (key, mid)
+    return {
+        f"claude-{tier}-{major}": mid
+        for (tier, major), (_, mid) in best_major.items()
+    }
+
+
+def fetch_copilot_model_ids(token: str, *, timeout: float = 15.0) -> list[str]:
+    """GET api.githubcopilot.com/models and return model id strings."""
+    headers: dict[str, str] = {
+        **_COPILOT_EDITOR_HEADERS,
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    conn = http.client.HTTPSConnection(COPILOT_HOST, context=SSL_CTX, timeout=timeout)
+    try:
+        conn.request("GET", "/models", headers=headers)
+        resp: http.client.HTTPResponse = conn.getresponse()
+        raw: bytes = resp.read()
+        if resp.status != 200:
+            raise RuntimeError(
+                f"GET /models HTTP {resp.status}: {raw[:200]!r}"
+            )
+        payload: Any = json.loads(raw)
+    finally:
+        conn.close()
+
+    items: Any = payload.get("data", []) if isinstance(payload, dict) else payload
+    ids: list[str] = []
+    if isinstance(items, list):
+        for it in items:
+            if isinstance(it, dict) and it.get("id"):
+                ids.append(str(it["id"]))
+            elif isinstance(it, str):
+                ids.append(it)
+    return ids
+
+
+def apply_discovered_claude_defaults(
+    model_ids: list[str],
+    *,
+    update_opus: bool,
+    update_no_opus_target: bool,
+) -> dict[str, str]:
+    """Apply catalog discovery to opus pin, no-opus target, and family map."""
+    global _opus_model, _no_opus_target, _latest_claude_models
+
+    latest: dict[str, str] = discover_latest_claude_models(model_ids)
+    _latest_claude_models = dict(latest)
+    family: dict[str, str] = build_family_map(model_ids)
+    # Bare family aliases → absolute newest in that series.
+    if "sonnet" in latest:
+        family["claude-sonnet"] = latest["sonnet"]
+    if "haiku" in latest:
+        family["claude-haiku"] = latest["haiku"]
+    if family:
+        _MODEL_FAMILY_MAP.clear()
+        _MODEL_FAMILY_MAP.update(family)
+
+    if update_opus and "opus" in latest:
+        _opus_model = latest["opus"]
+    if update_no_opus_target and "sonnet" in latest:
+        _no_opus_target = latest["sonnet"]
+    return latest
 
 
 def _resolve_opus(name: str) -> str:
@@ -729,9 +867,13 @@ def map_model_name(model: str) -> str:
     if m:
         return f"{m.group(1)}.{m.group(2)}"
 
-    # Base family: claude-sonnet-4 -> claude-sonnet-4.6 (latest known)
+    # Base family: claude-sonnet / claude-sonnet-4 / claude-haiku → discovered
+    # newest (bare tier → absolute latest; major-only → newest of that major).
     if stripped in _MODEL_FAMILY_MAP:
-        return _MODEL_FAMILY_MAP[stripped]
+        mapped = _MODEL_FAMILY_MAP[stripped]
+        if mapped != stripped:
+            logger.info("Pinning %s -> %s (latest family)", stripped, mapped)
+        return mapped
 
     logger.warning("Unknown model '%s', passing through as-is", model)
     return model
@@ -3345,11 +3487,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         token: str = copilot_token_manager.get_token()
         headers: dict[str, str] = {
+            **_COPILOT_EDITOR_HEADERS,
             "Authorization": f"Bearer {token}",
-            "Editor-Version": "vscode/1.96.0",
-            "Editor-Plugin-Version": "copilot/1.200.0",
-            "User-Agent": "GithubCopilot/1.200.0",
-            "Copilot-Integration-Id": "vscode-chat",
         }
         conn = http.client.HTTPSConnection(COPILOT_HOST, context=SSL_CTX)
         try:
@@ -3398,9 +3537,12 @@ if __name__ == "__main__":
     _upstream_model = args.upstream_model
     _upstream_base_url = args.upstream_base_url
     _upstream_api_key = args.upstream_api_key
-    _opus_model = args.opus_model
+    # None means "auto-discover from Copilot /models at startup".
+    _opus_model_explicit: bool = args.opus_model is not None
+    _no_opus_target_explicit: bool = args.no_opus_target is not None
+    _opus_model = args.opus_model or _FALLBACK_OPUS_MODEL
     _no_opus = args.no_opus
-    _no_opus_target = args.no_opus_target
+    _no_opus_target = args.no_opus_target or _FALLBACK_SONNET_MODEL
     _tavily_api_key = args.tavily_api_key
     _tavily_search_depth = args.tavily_search_depth
     _tavily_max_results = args.tavily_max_results
@@ -3447,6 +3589,52 @@ if __name__ == "__main__":
                 logger.error("Copilot auth failed: %s", e)
                 sys.exit(1)
 
+        # Discover newest opus/sonnet/haiku from Copilot's catalog and use them
+        # as defaults (unless the user pinned --opus-model / --no-opus-target).
+        discover_token: str | None = None
+        if copilot_token_manager is not None:
+            try:
+                discover_token = copilot_token_manager.get_token()
+            except TokenError as e:
+                logger.warning("Model discovery: Copilot token unavailable: %s", e)
+        if discover_token is None and token_manager is not None:
+            try:
+                discover_token = token_manager.get_token()
+            except TokenError as e:
+                logger.warning("Model discovery: gh token unavailable: %s", e)
+        if discover_token is not None:
+            try:
+                catalog: list[str] = fetch_copilot_model_ids(discover_token)
+                latest: dict[str, str] = apply_discovered_claude_defaults(
+                    catalog,
+                    update_opus=not _opus_model_explicit,
+                    update_no_opus_target=not _no_opus_target_explicit,
+                )
+                if latest:
+                    logger.info(
+                        "Model discovery: opus=%s sonnet=%s haiku=%s",
+                        latest.get("opus", "?"),
+                        latest.get("sonnet", "?"),
+                        latest.get("haiku", "?"),
+                        extra={"banner": True},
+                    )
+                else:
+                    logger.warning(
+                        "Model discovery: no claude opus/sonnet/haiku ids in catalog"
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Model discovery failed (%s); using fallbacks "
+                    "opus=%s sonnet=%s haiku=%s",
+                    e, _opus_model, _no_opus_target, _FALLBACK_HAIKU_MODEL,
+                )
+        else:
+            logger.warning(
+                "Model discovery skipped (no auth token); using fallbacks "
+                "opus=%s sonnet=%s",
+                _opus_model, _no_opus_target,
+            )
+
     banner("cc-gh-proxy starting on http://%s:%d", args.host, args.port)
     if _upstream_base_url:
         banner("  Upstream: %s (local OpenAI-compatible)", _upstream_base_url)
@@ -3471,6 +3659,14 @@ if __name__ == "__main__":
         banner("  Opus downgrade: ENABLED (claude-opus-* -> %s)", _no_opus_target)
     else:
         banner("  Opus model: claude-opus-* -> %s", _opus_model)
+    banner(
+        "  Sonnet default: %s",
+        _latest_claude_models.get("sonnet", _FALLBACK_SONNET_MODEL),
+    )
+    banner(
+        "  Haiku default: %s",
+        _latest_claude_models.get("haiku", _FALLBACK_HAIKU_MODEL),
+    )
     if _tavily_api_key:
         banner(
             "  Tavily search: ENABLED -> %s (depth=%s, max_results=%d)",

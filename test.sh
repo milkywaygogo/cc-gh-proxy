@@ -131,6 +131,44 @@ assert mod.map_model_name("claude-haiku-4-5") == "claude-haiku-4.5"
 # Custom target honored
 mod._no_opus_target = "claude-sonnet-4.5"
 assert mod.map_model_name("claude-opus-4-7") == "claude-sonnet-4.5"
+
+# Startup discovery: newest per series; prefer bare over -fast
+catalog = [
+    "claude-opus-4.7",
+    "claude-opus-4.8-fast",
+    "claude-opus-4.8",
+    "claude-opus-5",
+    "claude-sonnet-4.6",
+    "claude-sonnet-5",
+    "claude-haiku-4.5",
+    "claude-fable-5",
+    "gpt-5.1",
+]
+latest = mod.discover_latest_claude_models(catalog)
+assert latest == {
+    "opus": "claude-opus-5",
+    "sonnet": "claude-sonnet-5",
+    "haiku": "claude-haiku-4.5",
+}, latest
+# Prefer bare over -fast when versions tie
+assert mod.discover_latest_claude_models(
+    ["claude-opus-4.8-fast", "claude-opus-4.8"]
+) == {"opus": "claude-opus-4.8"}
+family = mod.build_family_map(catalog)
+assert family["claude-sonnet-4"] == "claude-sonnet-4.6"
+assert family["claude-sonnet-5"] == "claude-sonnet-5"
+assert family["claude-haiku-4"] == "claude-haiku-4.5"
+assert "claude-opus-5" not in family  # opus pinned separately
+mod.apply_discovered_claude_defaults(
+    catalog, update_opus=True, update_no_opus_target=True,
+)
+assert mod._opus_model == "claude-opus-5"
+assert mod._no_opus_target == "claude-sonnet-5"
+assert mod.map_model_name("claude-sonnet-5") == "claude-sonnet-5"
+assert mod.map_model_name("claude-sonnet-4") == "claude-sonnet-4.6"
+# Bare series names pin to the discovered latest
+assert mod.map_model_name("claude-sonnet") == "claude-sonnet-5"
+assert mod.map_model_name("claude-haiku") == "claude-haiku-4.5"
 print("ok")
 PY
 then
